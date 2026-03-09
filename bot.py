@@ -71,12 +71,24 @@ class OBBFastBot(ClientXMPP):
 
         # Регистрируем плагин XEP-0030 (Service Discovery)
         self.register_plugin('xep_0030')
+        # Регистрируем плагин XEP-0199 (XMPP Ping)
+        self.register_plugin('xep_0199')
+        # Регистрируем плагин XEP-0092 (Software Version)
+        self.register_plugin('xep_0092')
+        self['xep_0092'].software_name = 'OBBFastBot'
+        self['xep_0092'].version = VERSION
 
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
 
         # Подписываемся на входящие сообщения (chat / normal)
         self.add_event_handler("message", self.handle_message)
+
+        # Обработка подписки на присутствие
+        self.add_event_handler("presence_subscribe", self.handle_presence_subscribe)
+        self.add_event_handler("presence_subscribed", self.handle_presence_subscribed)
+        self.add_event_handler("presence_unsubscribe", self.handle_presence_unsubscribe)
+        self.add_event_handler("presence_unsubscribed", self.handle_presence_unsubscribed)
 
         # Обработчики для логирования XML
         self.add_event_handler("xml_in", self.log_xml_in)
@@ -206,6 +218,41 @@ class OBBFastBot(ClientXMPP):
         # На случай очень больших чисел (маловероятно)
         return f"{size:.2f} GB"
 
+    # Обработчик запроса на подписку
+    def handle_presence_subscribe(self, presence):
+        jid = presence['from'].bare
+        logging.info(f"🆕 Запрос подписки от {jid}")
+
+        # Уведомляем администратора
+        if ADMIN_JID:
+            self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку")
+
+        # Автоматически подтверждаем подписку
+        self.send_presence(pto=jid, ptype='subscribed')
+        # И подписываемся в ответ
+        self.send_presence(pto=jid, ptype='subscribe')
+
+    # Обработчик подтверждения подписки
+    def handle_presence_subscribed(self, presence):
+        jid = presence['from'].bare
+        logging.info(f"✅ Подписка подтверждена от {jid}")
+        if ADMIN_JID:
+            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку")
+
+    # Обработчик запроса на отмену подписки
+    def handle_presence_unsubscribe(self, presence):
+        jid = presence['from'].bare
+        logging.info(f"➖ Запрос отписки от {jid}")
+        if ADMIN_JID:
+            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов")
+
+    # Обработчик подтверждения отмены подписки
+    def handle_presence_unsubscribed(self, presence):
+        jid = presence['from'].bare
+        logging.info(f"❌ Подписка отменена от {jid}")
+        if ADMIN_JID:
+            self.send_message(mto=ADMIN_JID, mbody=f"❌ Пользователь {jid} отменил подписку")
+
     # Обработчик обычных текстовых сообщений
     def handle_message(self, msg):
         # Обрабатываем только личные сообщения с текстом
@@ -214,6 +261,9 @@ class OBBFastBot(ClientXMPP):
 
         # Проверка белого списка
         if not self.is_allowed(msg['from']):
+            logging.info(f"ACCESS DENIED (msg) from {msg['from']}")
+            if ADMIN_JID:
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}")
             return
 
         # Разбиваем сообщение на части
@@ -314,7 +364,9 @@ class OBBFastBot(ClientXMPP):
     def handle_raw_si(self, iq):
         # Проверка белого списка
         if not self.is_allowed(iq['from']):
-            logging.info(f"SI DENIED: {iq['from']}")
+            logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
+            if ADMIN_JID:
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}")
             reply = iq.reply()
             reply['type'] = 'error'
             return reply.send()
