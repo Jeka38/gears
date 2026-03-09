@@ -126,6 +126,11 @@ class OBBFastBot(ClientXMPP):
             matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'),
             self.handle_ping))
 
+        # Явный обработчик для Jingle
+        self.register_handler(handler.Callback('Jingle',
+            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:jingle:1}jingle'),
+            self.handle_jingle))
+
     # Асинхронный цикл очистки зависших передач
     async def cleanup_pending_files(self):
         while True:
@@ -562,7 +567,79 @@ class OBBFastBot(ClientXMPP):
             logging.info(f"IBB STREAM START: sid={sid}")
             asyncio.create_task(self.save_file_task(stream, file_info, file_info['from']))
         else:
+            # Пробуем найти по Jingle SID
+            for info in self.pending_files.values():
+                if info.get('jingle_sid') == sid:
+                    logging.info(f"IBB STREAM START (Jingle): sid={sid}")
+                    asyncio.create_task(self.save_file_task(stream, info, info['from']))
+                    return
             logging.warning(f"IBB STREAM: Unknown SID {sid}")
+
+    # Обработчик Jingle (XEP-0166)
+    def handle_jingle(self, iq):
+        jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
+        action = jingle.get('action')
+        sid = jingle.get('sid')
+        logging.info(f"JINGLE {action} from {iq['from']}, sid={sid}")
+
+        if action == 'session-initiate':
+            # Парсим описание файла (XEP-0234)
+            content = jingle.find('{urn:xmpp:jingle:1}content')
+            description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
+            file_tag = description.find('{urn:xmpp:jingle:apps:file-transfer:5}file')
+
+            fname = file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}name').text
+            fsize = int(file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}size').text)
+            fname = os.path.basename(fname).replace(' ', '_')
+
+            # Запоминаем инфо
+            self.pending_files[sid] = {
+                'name': fname,
+                'size': fsize,
+                'from': iq['from'].bare,
+                'jingle_sid': sid,
+                'timestamp': asyncio.get_event_loop().time()
+            }
+
+            # Соглашаемся (session-accept)
+            reply = iq.reply()
+            res_jingle = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                'action': 'session-accept',
+                'sid': sid,
+                'initiator': iq['from'].full
+            })
+
+            # Копируем структуру content/description/transport
+            res_content = ET.SubElement(res_jingle, '{urn:xmpp:jingle:1}content', {
+                'creator': content.get('creator'),
+                'name': content.get('name')
+            })
+            res_content.append(description)
+
+            # Выбираем транспорт (предпочитаем S5B если есть, иначе IBB)
+            transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+            if transport is not None:
+                res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:s5b:1}transport', {
+                    'sid': transport.get('sid')
+                })
+            else:
+                transport = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+                res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:ibb:1}transport', {
+                    'sid': transport.get('sid'),
+                    'block-size': transport.get('block-size')
+                })
+
+            reply.append(res_jingle)
+            reply.send()
+
+            # Если это S5B - запускаем ожидание подключения
+            if transport.tag.endswith('s5b:1}transport'):
+                asyncio.create_task(self._manual_socks5_connect(iq))
+
+        elif action == 'session-terminate':
+            if sid in self.pending_files:
+                del self.pending_files[sid]
+            iq.reply().send()
 
 
     # Обработчик XMPP Ping
@@ -665,11 +742,14 @@ class OBBFastBot(ClientXMPP):
                 self.send_message(
                     mto=iq['from'].bare,
                     mbody="⚠ Не найдено доступных путей для передачи (SOCKS5). "
-                          "Попробуйте включить In-Band Bytestreams (IBB) в настройках клиента.",
+                          "Бот пробует переключиться на Jingle/IBB...",
                     mtype='chat'
                 )
             reply = iq.reply()
             reply['type'] = 'error'
+            # Предлагаем клиенту попробовать Jingle (XEP-0166)
+            reply['error']['condition'] = 'item-not-found'
+            reply['error']['text'] = 'SOCKS5 failed, trying Jingle fallback'
             reply.send()
 
         except Exception as e:
