@@ -206,7 +206,7 @@ class OBBFastBot(ClientXMPP):
             os.makedirs(user_dir)
             # Уведомляем администратора о новом пользователе
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {jid.bare} ({user_hash})")
+                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {jid.bare} ({user_hash})", mtype='chat')
 
         # Возвращаем путь к папке и хеш
         return user_dir, user_hash
@@ -233,7 +233,7 @@ class OBBFastBot(ClientXMPP):
 
         # Уведомляем администратора
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку")
+            self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку", mtype='chat')
 
         # Автоматически подтверждаем подписку
         self.send_presence(pto=jid, ptype='subscribed')
@@ -245,21 +245,21 @@ class OBBFastBot(ClientXMPP):
         jid = presence['from'].bare
         logging.info(f"✅ Подписка подтверждена от {jid}")
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку")
+            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку", mtype='chat')
 
     # Обработчик запроса на отмену подписки
     def handle_presence_unsubscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"➖ Запрос отписки от {jid}")
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов")
+            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов", mtype='chat')
 
     # Обработчик подтверждения отмены подписки
     def handle_presence_unsubscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"❌ Подписка отменена от {jid}")
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"❌ Пользователь {jid} отменил подписку")
+            self.send_message(mto=ADMIN_JID, mbody=f"❌ Пользователь {jid} отменил подписку", mtype='chat')
 
     # Обработчик обычных текстовых сообщений
     def handle_message(self, msg):
@@ -271,7 +271,7 @@ class OBBFastBot(ClientXMPP):
         if not self.is_allowed(msg['from']):
             logging.info(f"ACCESS DENIED (msg) from {msg['from']}")
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}")
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}", mtype='chat')
             return
 
         # Разбиваем сообщение на части
@@ -374,7 +374,7 @@ class OBBFastBot(ClientXMPP):
         if not self.is_allowed(iq['from']):
             logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}")
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}", mtype='chat')
             reply = iq.reply()
             reply['type'] = 'error'
             return reply.send()
