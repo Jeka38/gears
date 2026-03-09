@@ -120,9 +120,11 @@ class OBBFastBot(ClientXMPP):
 
     # Проверяем, разрешён ли доступ данному JID
     def is_allowed(self, jid):
+        bare_jid = jid.bare
+        if ADMIN_JID and bare_jid == ADMIN_JID:
+            return True
         if '*' in self.whitelist:
             return True
-        bare_jid = jid.bare
         domain = jid.domain
         return bare_jid in self.whitelist or domain in self.whitelist
 
@@ -274,7 +276,9 @@ class OBBFastBot(ClientXMPP):
     def handle_raw_si(self, iq):
         # Проверка белого списка
         if not self.is_allowed(iq['from']):
-            return iq.reply(type='error').send()
+            reply = iq.reply()
+            reply['type'] = 'error'
+            return reply.send()
 
         try:
             # Находим элемент <si>
@@ -291,7 +295,9 @@ class OBBFastBot(ClientXMPP):
             # Проверяем, хватит ли места в квоте
             if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
-                return iq.reply(type='error').send()
+                reply = iq.reply()
+                reply['type'] = 'error'
+                return reply.send()
 
             # Запоминаем информацию о файле, который сейчас будут передавать
             self.pending_files[sid] = {'name': fname, 'size': fsize}
@@ -381,7 +387,9 @@ class OBBFastBot(ClientXMPP):
                     continue
 
             # Если ни один прокси не сработал — ошибка
-            iq.reply(type='error').send()
+            reply = iq.reply()
+            reply['type'] = 'error'
+            reply.send()
 
         except:
             pass
