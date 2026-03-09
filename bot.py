@@ -1,0 +1,334 @@
+# Импорт модуля для работы с операционной системой (пути, файлы, окружение)
+import os
+
+# Импорт модуля для ведения логов (журналирования событий)
+import logging
+
+# Импорт модуля для асинхронного программирования
+import asyncio
+
+# Импорт модуля для вычисления хешей (здесь используется md5 и sha1)
+import hashlib
+
+# Импорт модуля для корректной работы с URL (в частности quote для имён файлов)
+import urllib.parse
+
+# Импорт функции для загрузки переменных окружения из .env файла
+from dotenv import load_dotenv
+
+# Импорт основного класса XMPP-клиента из библиотеки slixmpp
+from slixmpp import ClientXMPP
+
+# Импорт вспомогательных классов для работы с XML и обработчиками
+from slixmpp.xmlstream import ET, handler, matcher
+
+# Загружаем переменные из файла .env в os.environ
+load_dotenv()
+
+# Настраиваем базовое логирование: уровень INFO и простой формат
+logging.basicConfig(level=logging.INFO, format='%(levelname)-8s %(message)s')
+
+# Лимит квоты в гигабайтах (берём из переменной окружения или 15 по умолчанию)
+QUOTA_LIMIT_GB = int(os.getenv('QUOTA_GB', 15))
+
+# Переводим лимит в байты (1 ГБ = 1024³ байт)
+QUOTA_LIMIT_BYTES = QUOTA_LIMIT_GB * 1024 * 1024 * 1024
+
+
+# Основной класс бота — наследуется от ClientXMPP
+class OBBFastBot(ClientXMPP):
+
+    # Конструктор класса
+    def __init__(self, jid, password, dest_dir, base_url):
+        # Вызываем конструктор родительского класса (передаём JID и пароль)
+        super().__init__(jid, password)
+
+        # Папка, куда будем сохранять полученные файлы
+        self.dest_dir = dest_dir
+
+        # Базовый URL для скачивания файлов (без завершающего слеша)
+        self.base_url = (base_url or "").rstrip('/')
+
+        # Словарь для хранения информации о файлах, которые сейчас передаются
+        self.pending_files = {}
+
+        # Регистрируем плагин XEP-0030 (Service Discovery)
+        self.register_plugin('xep_0030')
+
+        # Подписываемся на событие успешного входа в сеть
+        self.add_event_handler("session_start", self.start)
+
+        # Подписываемся на входящие сообщения (chat / normal)
+        self.add_event_handler("message", self.handle_message)
+
+        # Регистрируем обработчик входящих SI (Stream Initiation) запросов
+        self.register_handler(handler.Callback('SI',
+            matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'),
+            self.handle_raw_si))
+
+        # Регистрируем обработчик входящих S5B (SOCKS5 Bytestreams) запросов
+        self.register_handler(handler.Callback('S5B',
+            matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/bytestreams}query'),
+            self.handle_raw_s5b))
+
+    # Асинхронный обработчик события успешного входа в аккаунт
+    async def start(self, event):
+        # Сообщаем серверу, что мы поддерживаем SI (Stream Initiation)
+        self['xep_0030'].add_feature('http://jabber.org/protocol/si')
+
+        # Сообщаем, что поддерживаем SOCKS5 Bytestreams
+        self['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
+
+        # Указываем, что поддерживаем профиль передачи файлов через SI
+        self['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
+
+        # Отправляем присутствие (online)
+        self.send_presence()
+
+        # Запрашиваем ростер (список контактов)
+        await self.get_roster()
+
+        # Пишем в лог, что бот успешно запустился
+        logging.info(f"✅ БОТ ЗАПУЩЕН: {self.boundjid}")
+
+    # Получаем (и при необходимости создаём) персональную папку пользователя
+    def get_user_info(self, jid):
+        # Берём bare JID (без ресурса) и считаем от него md5
+        user_hash = hashlib.md5(jid.bare.encode()).hexdigest()
+
+        # Формируем путь к папке пользователя
+        user_dir = os.path.join(self.dest_dir, user_hash)
+
+        # Создаём папку, если её ещё нет
+        if not os.path.exists(user_dir):
+            os.makedirs(user_dir)
+
+        # Возвращаем путь к папке и хеш
+        return user_dir, user_hash
+
+    # Подсчитываем суммарный размер всех файлов в папке (рекурсивно)
+    def get_dir_size(self, path):
+        # Суммируем размер каждого файла во всех вложенных папках
+        return sum(os.path.getsize(os.path.join(d, f))
+                   for d, _, fs in os.walk(path) for f in fs)
+
+    # Форматируем размер в человеко-читаемый вид (B → KB → MB → GB)
+    def format_size(self, size):
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024:
+                return f"{size:.2f} {unit}"
+            size /= 1024
+        # На случай очень больших чисел (маловероятно)
+        return f"{size:.2f} GB"
+
+    # Обработчик обычных текстовых сообщений
+    def handle_message(self, msg):
+        # Обрабатываем только личные сообщения с текстом
+        if msg['type'] not in ('chat', 'normal') or not msg['body']:
+            return
+
+        # Приводим текст к нижнему регистру и убираем пробелы по краям
+        text = msg['body'].strip().lower()
+
+        # Получаем папку и хеш пользователя
+        user_dir, user_hash = self.get_user_info(msg['from'])
+
+        # Команда помощи
+        if text in ('help', '?', '🛠'):
+            used = self.get_dir_size(user_dir)
+            help_text = (
+                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№|*>, get <№|*>, help\n\n"
+                f"📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}\n"
+            )
+            msg.reply(help_text).send()
+
+        # Команда показа списка файлов
+        elif text.startswith('ls'):
+            files = sorted(os.listdir(user_dir))
+            if not files:
+                return msg.reply("📁 Папка пуста").send()
+
+            short = '-s' in text  # короткий формат (только имена)
+            res = [f"{i+1}. {f}" + ("" if short else f"\n🔗 {self.base_url}/{user_hash}/{urllib.parse.quote(f)}")
+                   for i, f in enumerate(files)]
+            msg.reply("\n".join(res)).send()
+
+        # Команда удаления файлов
+        elif text.startswith('rm'):
+            files = sorted(os.listdir(user_dir))
+            if '*' in text:
+                for f in files:
+                    os.remove(os.path.join(user_dir, f))
+                msg.reply("🗑 Очищено.").send()
+
+    # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
+    def handle_raw_si(self, iq):
+        try:
+            # Находим элемент <si>
+            si = iq.xml.find('{http://jabber.org/protocol/si}si')
+
+            # ID сессии передачи и элемент <file>
+            sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+
+            # Имя и размер файла, который хочет отправить собеседник
+            fname, fsize = tag.get('name'), int(tag.get('size', 0))
+
+            user_dir, _ = self.get_user_info(iq['from'])
+
+            # Проверяем, хватит ли места в квоте
+            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
+                return iq.reply(type='error').send()
+
+            # Запоминаем информацию о файле, который сейчас будут передавать
+            self.pending_files[sid] = {'name': fname, 'size': fsize}
+
+            # Формируем ответ: соглашаемся на SOCKS5
+            reply = iq.reply()
+            res_si = ET.Element('{http://jabber.org/protocol/si}si')
+            feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
+            x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
+            field = ET.SubElement(x, 'field', var='stream-method')
+            ET.SubElement(field, 'value').text = 'http://jabber.org/protocol/bytestreams'
+
+            reply.append(res_si)
+            reply.send()
+
+        except:
+            # Если что-то сломалось — молча игнорируем (не отвечаем)
+            pass
+
+    # Обработчик входящего запроса SOCKS5 Bytestreams
+    def handle_raw_s5b(self, iq):
+        # Запускаем асинхронную задачу обработки SOCKS5
+        asyncio.create_task(self._manual_socks5_connect(iq))
+
+    # Асинхронная функция подключения по SOCKS5 и приёма файла
+    async def _manual_socks5_connect(self, iq):
+        try:
+            query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
+            sid = query.get('sid')
+            file_info = self.pending_files.get(sid)
+
+            if not file_info:
+                return
+
+            # Вычисляем адрес SOCKS5 в соответствии со спецификацией
+            dst_addr = hashlib.sha1(
+                f"{sid}{iq['from'].full}{self.boundjid.full}".encode()
+            ).hexdigest()
+
+            # Пробуем каждый предложенный streamhost по очереди
+            for host in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
+                try:
+                    # Устанавливаем TCP-соединение
+                    reader, writer = await asyncio.wait_for(
+                        asyncio.open_connection(host.get('host'), int(host.get('port', 1080))),
+                        5
+                    )
+
+                    # SOCKS5 handshake: без аутентификации
+                    writer.write(b"\x05\x01\x00")
+                    await writer.drain()
+
+                    if (await reader.read(2)) != b"\x05\x00":
+                        writer.close()
+                        continue
+
+                    # Запрос на соединение с вычисленным адресом
+                    writer.write(b"\x05\x01\x00\x03" + bytes([len(dst_addr)]) + dst_addr.encode() + b"\x00\x00")
+                    await writer.drain()
+
+                    resp = await reader.read(4)
+                    if not resp or resp[1] != 0x00:
+                        writer.close()
+                        continue
+
+                    # Пропускаем остаток ответа в зависимости от типа адреса
+                    atyp = resp[3]
+                    if atyp == 0x01:    await reader.read(6)
+                    elif atyp == 0x03:  addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
+                    elif atyp == 0x04:  await reader.read(18)
+
+                    # Отвечаем, что используем именно этот streamhost
+                    reply = iq.reply()
+                    res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                    ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
+                    reply.append(res_q)
+                    reply.send()
+
+                    # Запускаем приём файла
+                    await self.download_file_task(reader, file_info, iq['from'])
+
+                    writer.close()
+                    await writer.wait_closed()
+                    return
+
+                except:
+                    continue
+
+            # Если ни один прокси не сработал — ошибка
+            iq.reply(type='error').send()
+
+        except:
+            pass
+
+    # Асинхронная функция непосредственного приёма данных файла
+    async def download_file_task(self, reader, file_info, peer_jid):
+        user_dir, user_hash = self.get_user_info(peer_jid)
+        path = os.path.join(user_dir, file_info['name'])
+        received = 0
+
+        try:
+            with open(path, 'wb') as f:
+                while received < file_info['size']:
+                    # Читаем кусок до 1 МБ
+                    chunk = await reader.read(min(file_info['size'] - received, 1048576))
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Если всё получили полностью — сообщаем пользователю ссылку
+            if received == file_info['size']:
+                self.send_message(
+                    mto=peer_jid,
+                    mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{urllib.parse.quote(file_info['name'])}",
+                    mtype='chat'
+                )
+
+        except:
+            # При любой ошибке просто завершаем задачу (файл может быть битым)
+            pass
+
+
+# Точка входа — основная асинхронная функция
+async def main():
+    # Создаём экземпляр бота, передавая параметры из переменных окружения
+    bot = OBBFastBot(
+        os.getenv('XMPP_JID'),
+        os.getenv('XMPP_PASSWORD'),
+        os.getenv('DOWNLOAD_DIR'),
+        os.getenv('BASE_URL')
+    )
+
+    # Явно указываем механизм SASL (некоторые серверы требуют именно его)
+    bot.sasl_mechanism = 'SCRAM-SHA-1'
+
+    # Отключаем проблемные / устаревшие механизмы
+    bot.disabled_sasl_mechanisms = {'DIGEST-MD5', 'SCRAM-SHA-1-PLUS'}
+
+    # Запускаем соединение с указанным сервером и портом
+    bot.connect((os.getenv('XMPP_HOST', 'jabberworld.info'), 5222))
+
+    # Ждём отключения (работаем до разрыва соединения)
+    await bot.disconnected
+
+
+# Запуск программы
+if __name__ == '__main__':
+    # Запускаем асинхронный цикл событий
+    asyncio.run(main())
