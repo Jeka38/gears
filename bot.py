@@ -1,6 +1,9 @@
 # Импорт модуля для работы с операционной системой (пути, файлы, окружение)
 import os
 
+# Импорт модуля для получения версии Python
+import platform
+
 # Импорт модуля для ведения логов (журналирования событий)
 import logging
 
@@ -44,7 +47,7 @@ ADMIN_JID = os.getenv('ADMIN_JID')
 WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
 # Версия софта
-VERSION = "1.1"
+VERSION = os.getenv('APP_VERSION', '1.1')
 
 
 # Основной класс бота — наследуется от ClientXMPP
@@ -69,14 +72,22 @@ class OBBFastBot(ClientXMPP):
         self.whitelist = set()
         self.load_whitelist()
 
+        # Миграция имен файлов (замена пробелов на подчёркивания)
+        self.migrate_filenames()
+
         # Регистрируем плагин XEP-0030 (Service Discovery)
         self.register_plugin('xep_0030')
         # Регистрируем плагин XEP-0199 (XMPP Ping)
         self.register_plugin('xep_0199')
+        # Включаем автоматический пинг сервера (Keepalive) каждые 60 секунд
+        self['xep_0199'].send_keepalive = True
+        self['xep_0199'].interval = 60
         # Регистрируем плагин XEP-0092 (Software Version)
         self.register_plugin('xep_0092')
-        self['xep_0092'].software_name = 'OBBFastBot'
-        self['xep_0092'].version = VERSION
+        self['xep_0092'].software_name = os.getenv('APP_NAME', 'OBBFastBot')
+        # Версия в стиле: OBBFastBot 1.1 on Python 3.12.12 + slixmpp
+        import slixmpp
+        self['xep_0092'].version = f"{VERSION} on Python {platform.python_version()} + slixmpp {slixmpp.__version__}"
 
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
@@ -103,6 +114,11 @@ class OBBFastBot(ClientXMPP):
         self.register_handler(handler.Callback('S5B',
             matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/bytestreams}query'),
             self.handle_raw_s5b))
+
+        # Явный обработчик для XEP-0199 Ping (некоторые клиенты ждут элемент в ответе)
+        self.register_handler(handler.Callback('Ping',
+            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'),
+            self.handle_ping))
 
     # Асинхронный цикл очистки зависших передач
     async def cleanup_pending_files(self):
@@ -188,10 +204,35 @@ class OBBFastBot(ClientXMPP):
         domain = jid.domain
         return bare_jid in self.whitelist or domain in self.whitelist
 
+    # Рекурсивная замена пробелов на подчёркивания в именах файлов
+    def migrate_filenames(self):
+        logging.info("START: Filename migration (spaces to underscores)")
+        count = 0
+        for root, dirs, files in os.walk(self.dest_dir):
+            for f in files:
+                if ' ' in f:
+                    old_path = os.path.join(root, f)
+                    new_path = os.path.join(root, f.replace(' ', '_'))
+                    try:
+                        os.rename(old_path, new_path)
+                        count += 1
+                    except Exception as e:
+                        logging.error(f"MIGRATE ERROR for {old_path}: {e}")
+        if count > 0:
+            logging.info(f"FINISH: Renamed {count} files during migration")
+
     # Красивое кодирование URL (сохраняем кириллицу для читаемости)
     def safe_quote(self, text):
-        return "".join(c if ord(c) >= 128 or c.isalnum() or c in '._-~/:?=&'
+        # Заменяем пробелы на подчёркивания
+        text = text.replace(' ', '_')
+        return "".join(c if ord(c) >= 128 or c.isalnum() or c in '._-~/:?=&()'
                        else urllib.parse.quote(c) for c in text)
+
+    def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
+                     mfrom=None, mnick=None):
+        if mbody and not mbody.startswith('\n'):
+            mbody = '\n' + mbody
+        super().send_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
 
     # Получаем (и при необходимости создаём) персональную папку пользователя
     def get_user_info(self, jid):
@@ -206,7 +247,7 @@ class OBBFastBot(ClientXMPP):
             os.makedirs(user_dir)
             # Уведомляем администратора о новом пользователе
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {jid.bare} ({user_hash})")
+                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {jid.bare} ({user_hash})", mtype='chat')
 
         # Возвращаем путь к папке и хеш
         return user_dir, user_hash
@@ -217,14 +258,32 @@ class OBBFastBot(ClientXMPP):
         return sum(os.path.getsize(os.path.join(d, f))
                    for d, _, fs in os.walk(path) for f in fs)
 
-    # Форматируем размер в человеко-читаемый вид (B → KB → MB → GB)
+    # Форматируем размер в человеко-читаемый вид (B → kB → MB → GB)
     def format_size(self, size):
-        for unit in ['B', 'KB', 'MB', 'GB']:
+        for unit in ['B', 'kB', 'MB', 'GB']:
             if size < 1024:
-                return f"{size:.2f} {unit}"
+                return f"{size:.1f}{unit}"
             size /= 1024
-        # На случай очень больших чисел (маловероятно)
-        return f"{size:.2f} GB"
+        return f"{size:.1f}GB"
+
+    def get_help_text(self, is_admin=False):
+        text = (
+            "команды:\n"
+            "ls - список ссылок на файлы в папке пользователя.\n"
+            "ls <-s> - простой список файлов. Пример: ls -s\n"
+            "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
+            "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
+            "ping - проверить доступность бота.\n"
+            "help или ? - список команд."
+        )
+        if is_admin:
+            text += (
+                "\n\n🔧 Админ-команды:\n"
+                "add <jid|domain|*> - разрешить доступ (используйте * чтобы разрешить всем).\n"
+                "del <jid|domain|*> - запретить доступ.\n"
+                "list - показать белый список."
+            )
+        return text
 
     # Обработчик запроса на подписку
     def handle_presence_subscribe(self, presence):
@@ -233,33 +292,38 @@ class OBBFastBot(ClientXMPP):
 
         # Уведомляем администратора
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку")
+            self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку", mtype='chat')
 
         # Автоматически подтверждаем подписку
         self.send_presence(pto=jid, ptype='subscribed')
         # И подписываемся в ответ
         self.send_presence(pto=jid, ptype='subscribe')
 
+        # Приветственное сообщение
+        is_admin = ADMIN_JID and jid == ADMIN_JID
+        welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text(is_admin)}"
+        self.send_message(mto=jid, mbody=welcome_msg, mtype='chat')
+
     # Обработчик подтверждения подписки
     def handle_presence_subscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"✅ Подписка подтверждена от {jid}")
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку")
+            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку", mtype='chat')
 
     # Обработчик запроса на отмену подписки
     def handle_presence_unsubscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"➖ Запрос отписки от {jid}")
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов")
+            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов", mtype='chat')
 
     # Обработчик подтверждения отмены подписки
     def handle_presence_unsubscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"❌ Подписка отменена от {jid}")
         if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"❌ Пользователь {jid} отменил подписку")
+            self.send_message(mto=ADMIN_JID, mbody=f"❌ Пользователь {jid} отменил подписку", mtype='chat')
 
     # Обработчик обычных текстовых сообщений
     def handle_message(self, msg):
@@ -271,7 +335,7 @@ class OBBFastBot(ClientXMPP):
         if not self.is_allowed(msg['from']):
             logging.info(f"ACCESS DENIED (msg) from {msg['from']}")
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}")
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}", mtype='chat')
             return
 
         # Разбиваем сообщение на части
@@ -283,90 +347,119 @@ class OBBFastBot(ClientXMPP):
         # Получаем папку и хеш пользователя
         user_dir, user_hash = self.get_user_info(msg['from'])
 
+        # Вспомогательная функция для ответов с новой строки
+        def reply(text):
+            self.send_message(mto=msg['from'], mbody=text, mtype='chat')
+
         # Команда помощи
-        if cmd in ('help', '?', '🛠'):
+        if cmd in ('help', '?'):
+            if len(parts) != 1: return
+            is_admin = ADMIN_JID and msg['from'].bare == ADMIN_JID
             used = self.get_dir_size(user_dir)
-            help_text = (
-                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№>, help, ping, version\n\n"
-                f"📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}\n"
-            )
-            if ADMIN_JID and msg['from'].bare == ADMIN_JID:
-                help_text += f"\n🔧 Админ-команды:\nadd <jid|domain|*>, del <jid|domain|*>, list\n"
-            msg.reply(help_text).send()
+            help_text = self.get_help_text(is_admin) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
+            reply(help_text)
 
         # Команда пинга
         elif cmd == 'ping':
-            msg.reply("pong").send()
-
-        # Команда версии
-        elif cmd == 'version':
-            msg.reply(f"OBBFastBot v{VERSION}").send()
+            if len(parts) != 1: return
+            reply("pong")
 
         # Команда показа списка файлов
         elif cmd == 'ls':
+            if len(parts) > 2: return
             files = sorted(os.listdir(user_dir))
             if not files:
-                return msg.reply("📁 Папка пуста").send()
+                return reply("📁 Папка пуста")
 
-            short = '-s' in parts  # короткий формат (только имена)
-            res = ["Список файлов:"]
+            if len(parts) == 2:
+                if parts[1] == '-s':
+                    res = []
+                    for i, f in enumerate(files):
+                        size = os.path.getsize(os.path.join(user_dir, f))
+                        res.append(f"{i+1} - {f} [{self.format_size(size)}]")
+                    reply("\n".join(res))
+                return
+
+            # По умолчанию (просто ls) - список ссылок
+            res = []
             for i, f in enumerate(files):
-                if short:
-                    res.append(f"{i+1}. {f}")
-                else:
-                    res.append(f"{i+1}. {f} | {self.base_url}/{user_hash}/{self.safe_quote(f)}")
-            msg.reply("\n".join(res)).send()
+                res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+            reply("\n".join(res))
 
         # Команда получения ссылки на файл
-        elif cmd == 'lnk':
+        elif cmd in ('link', 'lnk'):
+            if len(parts) != 2: return
             files = sorted(os.listdir(user_dir))
             if not files:
-                return msg.reply("📁 Папка пуста").send()
+                return reply("📁 Папка пуста")
 
-            if len(parts) > 1 and parts[1].isdigit():
-                idx = int(parts[1]) - 1
-                if 0 <= idx < len(files):
-                    f = files[idx]
-                    msg.reply(f"🔗 {self.base_url}/{user_hash}/{self.safe_quote(f)}").send()
-                else:
-                    msg.reply("❌ Некорректный номер файла.").send()
+            if parts[1] == '*':
+                res = []
+                for i, f in enumerate(files):
+                    res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+                reply("\n".join(res))
             else:
-                msg.reply("📖 Используйте: lnk <номер файла>").send()
+                try:
+                    indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())))
+                except ValueError: return
+
+                res = []
+                for idx in indices:
+                    if 0 <= idx < len(files):
+                        f = files[idx]
+                        res.append(f"{idx+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+                if res:
+                    reply("\n".join(res))
 
         # Команда удаления файлов
         elif cmd == 'rm':
+            if len(parts) != 2: return
             files = sorted(os.listdir(user_dir))
-            if '*' in parts or (len(parts) > 1 and parts[1] == '*'):
+            if not files:
+                return reply("📁 Папка пуста")
+
+            if parts[1] == '*':
                 for f in files:
                     os.remove(os.path.join(user_dir, f))
-                msg.reply("🗑 Очищено.").send()
-            elif len(parts) > 1 and parts[1].isdigit():
-                idx = int(parts[1]) - 1
-                if 0 <= idx < len(files):
-                    f = files[idx]
-                    os.remove(os.path.join(user_dir, f))
-                    msg.reply(f"🗑 Удалено: {f}").send()
-                else:
-                    msg.reply("❌ Некорректный номер файла.").send()
+                reply("🗑 Все файлы удалены.")
+            else:
+                try:
+                    indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())), reverse=True)
+                except ValueError: return
+
+                removed = []
+                for idx in indices:
+                    if 0 <= idx < len(files):
+                        f = files[idx]
+                        try:
+                            os.remove(os.path.join(user_dir, f))
+                            removed.append(f)
+                        except OSError:
+                            pass
+                if removed:
+                    reply(f"🗑 Удалено файлов: {len(removed)}")
 
         # Админ-команды для управления белым списком
         if ADMIN_JID and msg['from'].bare == ADMIN_JID:
-            if cmd == 'add' and len(parts) > 1:
+            if cmd == 'add' and len(parts) == 2:
                 entry = parts[1].lower()
                 self.whitelist.add(entry)
                 self.save_whitelist()
-                msg.reply(f"➕ Добавлено: {entry}").send()
-            elif cmd == 'del' and len(parts) > 1:
+                if entry == '*':
+                    reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
+                else:
+                    reply(f"➕ Добавлено: {entry}")
+            elif cmd == 'del' and len(parts) == 2:
                 entry = parts[1].lower()
                 if entry in self.whitelist:
                     self.whitelist.remove(entry)
                     self.save_whitelist()
-                    msg.reply(f"➖ Удалено: {entry}").send()
+                    reply(f"➖ Удалено: {entry}")
                 else:
-                    msg.reply(f"❓ Не найдено: {entry}").send()
-            elif cmd == 'list':
+                    reply(f"❓ Не найдено: {entry}")
+            elif cmd == 'list' and len(parts) == 1:
                 res = "\n".join(sorted(self.whitelist))
-                msg.reply(f"📄 Белый список:\n{res or '(пусто)'}").send()
+                reply(f"📄 Белый список:\n{res or '(пусто)'}")
 
     # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
     def handle_raw_si(self, iq):
@@ -374,7 +467,7 @@ class OBBFastBot(ClientXMPP):
         if not self.is_allowed(iq['from']):
             logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}")
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}", mtype='chat')
             reply = iq.reply()
             reply['type'] = 'error'
             return reply.send()
@@ -388,7 +481,8 @@ class OBBFastBot(ClientXMPP):
 
             # Имя и размер файла, который хочет отправить собеседник
             # Санитизируем имя файла для предотвращения Path Traversal
-            fname = os.path.basename(tag.get('name'))
+            # Заменяем пробелы на подчёркивания
+            fname = os.path.basename(tag.get('name')).replace(' ', '_')
             fsize = int(tag.get('size', 0))
             logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
 
@@ -430,6 +524,16 @@ class OBBFastBot(ClientXMPP):
         logging.info(f"S5B REQUEST from {iq['from']}")
         # Запускаем асинхронную задачу обработки SOCKS5
         asyncio.create_task(self._manual_socks5_connect(iq))
+
+    # Обработчик XMPP Ping
+    def handle_ping(self, iq):
+        logging.info(f"PING RECV from {iq['from']}")
+        reply = iq.reply()
+        # Добавляем элемент <ping xmlns="urn:xmpp:ping"/> в ответ
+        ping = ET.Element('{urn:xmpp:ping}ping')
+        reply.append(ping)
+        reply.send()
+        logging.info(f"PONG SENT to {iq['from']}")
 
     # Асинхронная функция подключения по SOCKS5 и приёма файла
     async def _manual_socks5_connect(self, iq):
