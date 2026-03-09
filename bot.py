@@ -344,8 +344,8 @@ class OBBFastBot(ClientXMPP):
             res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
-            field = ET.SubElement(x, 'field', var='stream-method')
-            ET.SubElement(field, 'value').text = 'http://jabber.org/protocol/bytestreams'
+            field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
+            ET.SubElement(field, '{jabber:x:data}value').text = 'http://jabber.org/protocol/bytestreams'
 
             reply.append(res_si)
             reply.send()
@@ -366,6 +366,9 @@ class OBBFastBot(ClientXMPP):
         sid = None
         try:
             query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
+            if query is None:
+                logging.error(f"SOCKS5: Query element not found in IQ: {iq}")
+                return
             sid = query.get('sid')
             file_info = self.pending_files.get(sid)
 
@@ -380,15 +383,19 @@ class OBBFastBot(ClientXMPP):
             logging.info(f"SOCKS5: Calculated dst_addr={dst_addr} for sid={sid}")
 
             # Пробуем каждый предложенный streamhost по очереди
-            for host in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
+            hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
+            logging.info(f"SOCKS5: Found {len(hosts)} streamhosts")
+            for host in hosts:
                 h_host, h_port, h_jid = host.get('host'), int(host.get('port', 1080)), host.get('jid')
                 logging.info(f"SOCKS5: Trying host {h_host}:{h_port} ({h_jid})")
                 try:
                     # Устанавливаем TCP-соединение
+                    logging.info(f"SOCKS5: Opening connection to {h_host}:{h_port}")
                     reader, writer = await asyncio.wait_for(
                         asyncio.open_connection(h_host, h_port),
                         5
                     )
+                    logging.info(f"SOCKS5: TCP connected to {h_host}:{h_port}")
 
                     # SOCKS5 handshake: без аутентификации
                     writer.write(b"\x05\x01\x00")
@@ -431,6 +438,9 @@ class OBBFastBot(ClientXMPP):
                     await writer.wait_closed()
                     return
 
+                except asyncio.TimeoutError:
+                    logging.warning(f"SOCKS5: Timeout connecting to {h_host}:{h_port}")
+                    continue
                 except Exception as e:
                     logging.warning(f"SOCKS5: Error with host {h_host}: {e}")
                     continue
