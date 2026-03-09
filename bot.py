@@ -72,6 +72,9 @@ class OBBFastBot(ClientXMPP):
         self.whitelist = set()
         self.load_whitelist()
 
+        # Миграция имен файлов (замена пробелов на подчёркивания)
+        self.migrate_filenames()
+
         # Регистрируем плагин XEP-0030 (Service Discovery)
         self.register_plugin('xep_0030')
         # Регистрируем плагин XEP-0199 (XMPP Ping)
@@ -201,9 +204,28 @@ class OBBFastBot(ClientXMPP):
         domain = jid.domain
         return bare_jid in self.whitelist or domain in self.whitelist
 
+    # Рекурсивная замена пробелов на подчёркивания в именах файлов
+    def migrate_filenames(self):
+        logging.info("START: Filename migration (spaces to underscores)")
+        count = 0
+        for root, dirs, files in os.walk(self.dest_dir):
+            for f in files:
+                if ' ' in f:
+                    old_path = os.path.join(root, f)
+                    new_path = os.path.join(root, f.replace(' ', '_'))
+                    try:
+                        os.rename(old_path, new_path)
+                        count += 1
+                    except Exception as e:
+                        logging.error(f"MIGRATE ERROR for {old_path}: {e}")
+        if count > 0:
+            logging.info(f"FINISH: Renamed {count} files during migration")
+
     # Красивое кодирование URL (сохраняем кириллицу для читаемости)
     def safe_quote(self, text):
-        return "".join(c if ord(c) >= 128 or c.isalnum() or c in ' ._-~/:?=&()'
+        # Заменяем пробелы на подчёркивания
+        text = text.replace(' ', '_')
+        return "".join(c if ord(c) >= 128 or c.isalnum() or c in '._-~/:?=&()'
                        else urllib.parse.quote(c) for c in text)
 
     def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
@@ -459,7 +481,8 @@ class OBBFastBot(ClientXMPP):
 
             # Имя и размер файла, который хочет отправить собеседник
             # Санитизируем имя файла для предотвращения Path Traversal
-            fname = os.path.basename(tag.get('name'))
+            # Заменяем пробелы на подчёркивания
+            fname = os.path.basename(tag.get('name')).replace(' ', '_')
             fsize = int(tag.get('size', 0))
             logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
 
