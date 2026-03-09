@@ -138,17 +138,25 @@ class OBBFastBot(ClientXMPP):
         # Пишем в лог, что бот успешно запустился
         logging.info(f"✅ БОТ ЗАПУЩЕН: {self.boundjid}")
 
-    # Загружаем белый список из файла
     def load_whitelist(self):
-        if os.path.exists(WHITELIST_FILE):
-            try:
+        try:
+            if os.path.exists(WHITELIST_FILE):
+
+                if os.path.isdir(WHITELIST_FILE):
+                    logging.warning(f"{WHITELIST_FILE} is directory, recreating file")
+                    os.rmdir(WHITELIST_FILE)
+
                 with open(WHITELIST_FILE, 'r') as f:
                     data = json.load(f)
                     self.whitelist = set(data)
-            except Exception as e:
-                logging.error(f"LOAD WHITELIST ERROR: {e}")
+
+            else:
                 self.whitelist = set()
-        else:
+                with open(WHITELIST_FILE, 'w') as f:
+                    json.dump([], f)
+
+        except Exception as e:
+            logging.error(f"LOAD WHITELIST ERROR: {e}")
             self.whitelist = set()
 
     # Сохраняем белый список в файл
