@@ -107,6 +107,11 @@ class OBBFastBot(ClientXMPP):
             matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/bytestreams}query'),
             self.handle_raw_s5b))
 
+        # Явный обработчик для XEP-0199 Ping (некоторые клиенты ждут элемент в ответе)
+        self.register_handler(handler.Callback('Ping',
+            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'),
+            self.handle_ping))
+
     # Асинхронный цикл очистки зависших передач
     async def cleanup_pending_files(self):
         while True:
@@ -491,6 +496,16 @@ class OBBFastBot(ClientXMPP):
         logging.info(f"S5B REQUEST from {iq['from']}")
         # Запускаем асинхронную задачу обработки SOCKS5
         asyncio.create_task(self._manual_socks5_connect(iq))
+
+    # Обработчик XMPP Ping
+    def handle_ping(self, iq):
+        logging.info(f"PING RECV from {iq['from']}")
+        reply = iq.reply()
+        # Добавляем элемент <ping xmlns="urn:xmpp:ping"/> в ответ
+        ping = ET.Element('{urn:xmpp:ping}ping')
+        reply.append(ping)
+        reply.send()
+        logging.info(f"PONG SENT to {iq['from']}")
 
     # Асинхронная функция подключения по SOCKS5 и приёма файла
     async def _manual_socks5_connect(self, iq):
