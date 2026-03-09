@@ -89,11 +89,22 @@ class OBBFastBot(ClientXMPP):
         import slixmpp
         self['xep_0092'].version = f"{VERSION} on Python {platform.python_version()} + slixmpp {slixmpp.__version__}"
 
+        # Регистрируем плагины для передачи файлов
+        self.register_plugin('xep_0047') # IBB
+        self.register_plugin('xep_0166') # Jingle
+        self.register_plugin('xep_0234') # Jingle File Transfer
+        self.register_plugin('xep_0260') # Jingle S5B
+        self.register_plugin('xep_0261') # Jingle IBB
+
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
 
         # Подписываемся на входящие сообщения (chat / normal)
         self.add_event_handler("message", self.handle_message)
+
+        # Обработчики для IBB и Jingle
+        self.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        self.add_event_handler("jingle_request", self.handle_jingle_request)
 
         # Обработка подписки на присутствие
         self.add_event_handler("presence_subscribe", self.handle_presence_subscribe)
@@ -144,6 +155,15 @@ class OBBFastBot(ClientXMPP):
 
         # Указываем, что поддерживаем профиль передачи файлов через SI
         self['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
+
+        # Поддержка IBB
+        self['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
+
+        # Поддержка Jingle
+        self['xep_0030'].add_feature('urn:xmpp:jingle:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
 
         # Отправляем присутствие (online)
         self.send_presence()
@@ -500,16 +520,27 @@ class OBBFastBot(ClientXMPP):
             self.pending_files[sid] = {
                 'name': fname,
                 'size': fsize,
+                'from': iq['from'].bare,
                 'timestamp': asyncio.get_event_loop().time()
             }
 
-            # Формируем ответ: соглашаемся на SOCKS5
+            # Определяем подходящий метод передачи из предложенных
+            feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
+            x_data = feature_neg.find('{jabber:x:data}x')
+            field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
+            options = [v.text for v in field.findall('{jabber:x:data}value')]
+
+            method = 'http://jabber.org/protocol/bytestreams' # По умолчанию S5B
+            if 'http://jabber.org/protocol/bytestreams' not in options and 'http://jabber.org/protocol/ibb' in options:
+                method = 'http://jabber.org/protocol/ibb'
+
+            # Формируем ответ
             reply = iq.reply()
             res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
-            ET.SubElement(field, '{jabber:x:data}value').text = 'http://jabber.org/protocol/bytestreams'
+            ET.SubElement(field, '{jabber:x:data}value').text = method
 
             reply.append(res_si)
             reply.send()
@@ -524,6 +555,28 @@ class OBBFastBot(ClientXMPP):
         logging.info(f"S5B REQUEST from {iq['from']}")
         # Запускаем асинхронную задачу обработки SOCKS5
         asyncio.create_task(self._manual_socks5_connect(iq))
+
+    # Обработчик начала IBB стрима
+    def handle_ibb_stream(self, stream):
+        sid = stream.sid
+        file_info = self.pending_files.get(sid)
+        if file_info:
+            logging.info(f"IBB STREAM START: sid={sid}")
+            asyncio.create_task(self.save_file_task(stream, file_info, file_info['from']))
+        else:
+            logging.warning(f"IBB STREAM: Unknown SID {sid}")
+
+    # Базовый обработчик Jingle запросов
+    def handle_jingle_request(self, iq):
+        # В данной версии реализуем базовый ответ 'error',
+        # так как полная реализация Jingle FT требует сложной логики состояний.
+        # Однако, плагины slixmpp xep_0234 и xep_0166 уже зарегистрированы,
+        # что позволяет расширять функционал в будущем.
+        logging.info(f"JINGLE REQUEST from {iq['from']}")
+        reply = iq.reply()
+        reply['type'] = 'error'
+        reply['error']['condition'] = 'feature-not-implemented'
+        reply.send()
 
     # Обработчик XMPP Ping
     def handle_ping(self, iq):
@@ -606,7 +659,7 @@ class OBBFastBot(ClientXMPP):
                     reply.send()
 
                     # Запускаем приём файла
-                    await self.download_file_task(reader, file_info, iq['from'])
+                    await self.save_file_task(reader, file_info, iq['from'])
 
                     writer.close()
                     await writer.wait_closed()
@@ -631,20 +684,26 @@ class OBBFastBot(ClientXMPP):
             if sid in self.pending_files:
                 del self.pending_files[sid]
 
-    # Асинхронная функция непосредственного приёма данных файла
-    async def download_file_task(self, reader, file_info, peer_jid):
+    # Асинхронная функция непосредственного приёма данных файла (общая для SOCKS5 и IBB)
+    async def save_file_task(self, stream, file_info, peer_jid):
         user_dir, user_hash = self.get_user_info(peer_jid)
-        # Санитизируем имя файла ещё раз при формировании пути
-        fname = os.path.basename(file_info['name'])
+        # Имя файла уже санитизировано в handle_raw_si
+        fname = file_info['name']
         path = os.path.join(user_dir, fname)
         received = 0
-        logging.info(f"DOWNLOAD START: {file_info['name']} to {path}")
+        logging.info(f"DOWNLOAD START: {fname} to {path}")
 
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    # Читаем кусок до 1 МБ
-                    chunk = await reader.read(min(file_info['size'] - received, 1048576))
+                    # IBB stream может иметь другой интерфейс чтения
+                    if hasattr(stream, 'read'):
+                        chunk = await stream.read(min(file_info['size'] - received, 1048576))
+                    elif hasattr(stream, 'recv'):
+                        chunk = await stream.recv()
+                    else:
+                        break
+
                     if not chunk:
                         break
                     f.write(chunk)
@@ -655,21 +714,19 @@ class OBBFastBot(ClientXMPP):
 
             # Если всё получили полностью — сообщаем пользователю ссылку
             if received == file_info['size']:
-                logging.info(f"DOWNLOAD COMPLETE: {file_info['name']}, {received} bytes")
-                safe_name = self.safe_quote(file_info['name'])
+                logging.info(f"DOWNLOAD COMPLETE: {fname}, {received} bytes")
+                safe_name = self.safe_quote(fname)
                 self.send_message(
                     mto=peer_jid,
                     mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_name}",
                     mtype='chat'
                 )
             else:
-                # Если файл не докачан — удаляем его, чтобы не занимал квоту
-                logging.warning(f"DOWNLOAD INCOMPLETE: {file_info['name']}, got {received}/{file_info['size']}. Deleting.")
+                logging.warning(f"DOWNLOAD INCOMPLETE: {fname}, got {received}/{file_info['size']}. Deleting.")
                 if os.path.exists(path):
                     os.remove(path)
 
         except Exception as e:
-            # При любой ошибке удаляем файл
             logging.error(f"Ошибка при приёме файла: {e}")
             if os.path.exists(path):
                 os.remove(path)
