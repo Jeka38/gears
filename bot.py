@@ -150,6 +150,9 @@ class OBBFastBot(ClientXMPP):
         bare_jid = jid.bare
         if ADMIN_JID and bare_jid == ADMIN_JID:
             return True
+        # По умолчанию разрешаем сервер аккаунта бота
+        if jid.domain == self.boundjid.domain:
+            return True
         if '*' in self.whitelist:
             return True
         domain = jid.domain
@@ -216,7 +219,7 @@ class OBBFastBot(ClientXMPP):
         if cmd in ('help', '?', '🛠'):
             used = self.get_dir_size(user_dir)
             help_text = (
-                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№|*>, help, ping, version\n\n"
+                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№>, help, ping, version\n\n"
                 f"📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}\n"
             )
             if ADMIN_JID and msg['from'].bare == ADMIN_JID:
@@ -283,12 +286,12 @@ class OBBFastBot(ClientXMPP):
             parts = msg['body'].split()
             cmd = parts[0].lower()
             if cmd == 'add' and len(parts) > 1:
-                entry = parts[1]
+                entry = parts[1].lower()
                 self.whitelist.add(entry)
                 self.save_whitelist()
                 msg.reply(f"➕ Добавлено: {entry}").send()
             elif cmd == 'del' and len(parts) > 1:
-                entry = parts[1]
+                entry = parts[1].lower()
                 if entry in self.whitelist:
                     self.whitelist.remove(entry)
                     self.save_whitelist()
