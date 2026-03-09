@@ -513,16 +513,23 @@ class OBBFastBot(ClientXMPP):
                 'timestamp': asyncio.get_event_loop().time()
             }
 
-            # Определяем подходящий метод передачи из предложенных
+            # Определяем подходящий метод передачи из предложенных (с защитой от отсутствующих полей)
+            options = []
             feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
-            x_data = feature_neg.find('{jabber:x:data}x')
-            field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
-            options = [v.text for v in field.findall('{jabber:x:data}value')]
+            if feature_neg is not None:
+                x_data = feature_neg.find('{jabber:x:data}x')
+                if x_data is not None:
+                    field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
+                    if field is not None:
+                        options = [v.text for v in field.findall('{jabber:x:data}value')]
 
             # Так как S5B часто не срабатывает, пробуем отдавать приоритет IBB если он предложен
             if 'http://jabber.org/protocol/ibb' in options:
                 method = 'http://jabber.org/protocol/ibb'
+            elif 'http://jabber.org/protocol/bytestreams' in options:
+                method = 'http://jabber.org/protocol/bytestreams'
             else:
+                # Если ничего не нашли - пробуем S5B как наиболее вероятный дефолт
                 method = 'http://jabber.org/protocol/bytestreams'
 
             # Формируем ответ
@@ -654,6 +661,13 @@ class OBBFastBot(ClientXMPP):
 
             # Если ни один прокси не сработал — ошибка
             logging.error(f"SOCKS5: All streamhosts failed for sid={sid}")
+            if not hosts:
+                self.send_message(
+                    mto=iq['from'].bare,
+                    mbody="⚠ Не найдено доступных путей для передачи (SOCKS5). "
+                          "Попробуйте включить In-Band Bytestreams (IBB) в настройках клиента.",
+                    mtype='chat'
+                )
             reply = iq.reply()
             reply['type'] = 'error'
             reply.send()
