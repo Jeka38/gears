@@ -10,6 +10,9 @@ import asyncio
 # Импорт модуля для вычисления хешей (здесь используется md5 и sha1)
 import hashlib
 
+# Импорт модуля для работы с форматом JSON
+import json
+
 # Импорт модуля для корректной работы с URL (в частности quote для имён файлов)
 import urllib.parse
 
@@ -38,7 +41,7 @@ QUOTA_LIMIT_BYTES = QUOTA_LIMIT_GB * 1024 * 1024 * 1024
 ADMIN_JID = os.getenv('ADMIN_JID')
 
 # Путь к файлу белого списка
-WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.txt')
+WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
 # Версия софта
 VERSION = "1.1"
@@ -126,16 +129,23 @@ class OBBFastBot(ClientXMPP):
     # Загружаем белый список из файла
     def load_whitelist(self):
         if os.path.exists(WHITELIST_FILE):
-            with open(WHITELIST_FILE, 'r') as f:
-                self.whitelist = {line.strip() for line in f if line.strip()}
+            try:
+                with open(WHITELIST_FILE, 'r') as f:
+                    data = json.load(f)
+                    self.whitelist = set(data)
+            except Exception as e:
+                logging.error(f"LOAD WHITELIST ERROR: {e}")
+                self.whitelist = set()
         else:
             self.whitelist = set()
 
     # Сохраняем белый список в файл
     def save_whitelist(self):
-        with open(WHITELIST_FILE, 'w') as f:
-            for entry in sorted(self.whitelist):
-                f.write(f"{entry}\n")
+        try:
+            with open(WHITELIST_FILE, 'w') as f:
+                json.dump(list(sorted(self.whitelist)), f, indent=4)
+        except Exception as e:
+            logging.error(f"SAVE WHITELIST ERROR: {e}")
 
     # Логирование входящего XML
     def log_xml_in(self, xml):
