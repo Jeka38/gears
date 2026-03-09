@@ -190,7 +190,7 @@ class OBBFastBot(ClientXMPP):
 
     # Красивое кодирование URL (сохраняем кириллицу для читаемости)
     def safe_quote(self, text):
-        return "".join(c if ord(c) >= 128 or c.isalnum() or c in '._-~/:?=&'
+        return "".join(c if ord(c) >= 128 or c.isalnum() or c in ' ._-~/:?=&'
                        else urllib.parse.quote(c) for c in text)
 
     def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
