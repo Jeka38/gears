@@ -91,10 +91,6 @@ class OBBFastBot(ClientXMPP):
 
         # Регистрируем плагины для передачи файлов
         self.register_plugin('xep_0047') # IBB
-        self.register_plugin('xep_0166') # Jingle
-        self.register_plugin('xep_0234') # Jingle File Transfer
-        self.register_plugin('xep_0260') # Jingle S5B
-        self.register_plugin('xep_0261') # Jingle IBB
 
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
@@ -102,9 +98,8 @@ class OBBFastBot(ClientXMPP):
         # Подписываемся на входящие сообщения (chat / normal)
         self.add_event_handler("message", self.handle_message)
 
-        # Обработчики для IBB и Jingle
+        # Обработчики для IBB
         self.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
-        self.add_event_handler("jingle_request", self.handle_jingle_request)
 
         # Обработка подписки на присутствие
         self.add_event_handler("presence_subscribe", self.handle_presence_subscribe)
@@ -158,12 +153,6 @@ class OBBFastBot(ClientXMPP):
 
         # Поддержка IBB
         self['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
-
-        # Поддержка Jingle
-        self['xep_0030'].add_feature('urn:xmpp:jingle:1')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
 
         # Отправляем присутствие (online)
         self.send_presence()
@@ -566,17 +555,6 @@ class OBBFastBot(ClientXMPP):
         else:
             logging.warning(f"IBB STREAM: Unknown SID {sid}")
 
-    # Базовый обработчик Jingle запросов
-    def handle_jingle_request(self, iq):
-        # В данной версии реализуем базовый ответ 'error',
-        # так как полная реализация Jingle FT требует сложной логики состояний.
-        # Однако, плагины slixmpp xep_0234 и xep_0166 уже зарегистрированы,
-        # что позволяет расширять функционал в будущем.
-        logging.info(f"JINGLE REQUEST from {iq['from']}")
-        reply = iq.reply()
-        reply['type'] = 'error'
-        reply['error']['condition'] = 'feature-not-implemented'
-        reply.send()
 
     # Обработчик XMPP Ping
     def handle_ping(self, iq):
