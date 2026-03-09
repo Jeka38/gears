@@ -44,7 +44,7 @@ ADMIN_JID = os.getenv('ADMIN_JID')
 WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
 # Версия софта
-VERSION = "1.1"
+VERSION = os.getenv('APP_VERSION', '1.1')
 
 
 # Основной класс бота — наследуется от ClientXMPP
