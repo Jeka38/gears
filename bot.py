@@ -1,6 +1,9 @@
 # Импорт модуля для работы с операционной системой (пути, файлы, окружение)
 import os
 
+# Импорт модуля для получения версии Python
+import platform
+
 # Импорт модуля для ведения логов (журналирования событий)
 import logging
 
@@ -79,7 +82,9 @@ class OBBFastBot(ClientXMPP):
         # Регистрируем плагин XEP-0092 (Software Version)
         self.register_plugin('xep_0092')
         self['xep_0092'].software_name = os.getenv('APP_NAME', 'OBBFastBot')
-        self['xep_0092'].version = VERSION
+        # Версия в стиле: OBBFastBot 1.1 on Python 3.12.12 + slixmpp
+        import slixmpp
+        self['xep_0092'].version = f"{VERSION} on Python {platform.python_version()} + slixmpp {slixmpp.__version__}"
 
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
@@ -198,7 +203,7 @@ class OBBFastBot(ClientXMPP):
 
     # Красивое кодирование URL (сохраняем кириллицу для читаемости)
     def safe_quote(self, text):
-        return "".join(c if ord(c) >= 128 or c.isalnum() or c in ' ._-~/:?=&'
+        return "".join(c if ord(c) >= 128 or c.isalnum() or c in ' ._-~/:?=&()'
                        else urllib.parse.quote(c) for c in text)
 
     def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
