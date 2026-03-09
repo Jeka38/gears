@@ -34,6 +34,15 @@ QUOTA_LIMIT_GB = int(os.getenv('QUOTA_GB', 15))
 # Переводим лимит в байты (1 ГБ = 1024³ байт)
 QUOTA_LIMIT_BYTES = QUOTA_LIMIT_GB * 1024 * 1024 * 1024
 
+# JID администратора
+ADMIN_JID = os.getenv('ADMIN_JID')
+
+# Путь к файлу белого списка
+WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.txt')
+
+# Версия софта
+VERSION = "1.1"
+
 
 # Основной класс бота — наследуется от ClientXMPP
 class OBBFastBot(ClientXMPP):
@@ -51,6 +60,10 @@ class OBBFastBot(ClientXMPP):
 
         # Словарь для хранения информации о файлах, которые сейчас передаются
         self.pending_files = {}
+
+        # Белый список
+        self.whitelist = set()
+        self.load_whitelist()
 
         # Регистрируем плагин XEP-0030 (Service Discovery)
         self.register_plugin('xep_0030')
@@ -91,6 +104,33 @@ class OBBFastBot(ClientXMPP):
         # Пишем в лог, что бот успешно запустился
         logging.info(f"✅ БОТ ЗАПУЩЕН: {self.boundjid}")
 
+    # Загружаем белый список из файла
+    def load_whitelist(self):
+        if os.path.exists(WHITELIST_FILE):
+            with open(WHITELIST_FILE, 'r') as f:
+                self.whitelist = {line.strip() for line in f if line.strip()}
+        else:
+            self.whitelist = set()
+
+    # Сохраняем белый список в файл
+    def save_whitelist(self):
+        with open(WHITELIST_FILE, 'w') as f:
+            for entry in sorted(self.whitelist):
+                f.write(f"{entry}\n")
+
+    # Проверяем, разрешён ли доступ данному JID
+    def is_allowed(self, jid):
+        if '*' in self.whitelist:
+            return True
+        bare_jid = jid.bare
+        domain = jid.domain
+        return bare_jid in self.whitelist or domain in self.whitelist
+
+    # Красивое кодирование URL (сохраняем кириллицу для читаемости)
+    def safe_quote(self, text):
+        return "".join(c if ord(c) >= 128 or c.isalnum() or c in '._-~/:?=&'
+                       else urllib.parse.quote(c) for c in text)
+
     # Получаем (и при необходимости создаём) персональную папку пользователя
     def get_user_info(self, jid):
         # Берём bare JID (без ресурса) и считаем от него md5
@@ -102,6 +142,9 @@ class OBBFastBot(ClientXMPP):
         # Создаём папку, если её ещё нет
         if not os.path.exists(user_dir):
             os.makedirs(user_dir)
+            # Уведомляем администратора о новом пользователе
+            if ADMIN_JID:
+                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {jid.bare} ({user_hash})")
 
         # Возвращаем путь к папке и хеш
         return user_dir, user_hash
@@ -127,42 +170,112 @@ class OBBFastBot(ClientXMPP):
         if msg['type'] not in ('chat', 'normal') or not msg['body']:
             return
 
-        # Приводим текст к нижнему регистру и убираем пробелы по краям
-        text = msg['body'].strip().lower()
+        # Проверка белого списка
+        if not self.is_allowed(msg['from']):
+            return
+
+        # Разбиваем сообщение на части
+        parts = msg['body'].strip().split()
+        if not parts:
+            return
+        cmd = parts[0].lower()
 
         # Получаем папку и хеш пользователя
         user_dir, user_hash = self.get_user_info(msg['from'])
 
         # Команда помощи
-        if text in ('help', '?', '🛠'):
+        if cmd in ('help', '?', '🛠'):
             used = self.get_dir_size(user_dir)
             help_text = (
-                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№|*>, get <№|*>, help\n\n"
+                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№|*>, help, ping, version\n\n"
                 f"📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}\n"
             )
+            if ADMIN_JID and msg['from'].bare == ADMIN_JID:
+                help_text += f"\n🔧 Админ-команды:\nadd <jid|domain|*>, del <jid|domain|*>, list\n"
             msg.reply(help_text).send()
 
+        # Команда пинга
+        elif cmd == 'ping':
+            msg.reply("pong").send()
+
+        # Команда версии
+        elif cmd == 'version':
+            msg.reply(f"OBBFastBot v{VERSION}").send()
+
         # Команда показа списка файлов
-        elif text.startswith('ls'):
+        elif cmd == 'ls':
             files = sorted(os.listdir(user_dir))
             if not files:
                 return msg.reply("📁 Папка пуста").send()
 
-            short = '-s' in text  # короткий формат (только имена)
-            res = [f"{i+1}. {f}" + ("" if short else f"\n🔗 {self.base_url}/{user_hash}/{urllib.parse.quote(f)}")
-                   for i, f in enumerate(files)]
+            short = '-s' in parts  # короткий формат (только имена)
+            res = ["Список файлов:"]
+            for i, f in enumerate(files):
+                if short:
+                    res.append(f"{i+1}. {f}")
+                else:
+                    res.append(f"{i+1}. {f} | {self.base_url}/{user_hash}/{self.safe_quote(f)}")
             msg.reply("\n".join(res)).send()
 
-        # Команда удаления файлов
-        elif text.startswith('rm'):
+        # Команда получения ссылки на файл
+        elif cmd == 'lnk':
             files = sorted(os.listdir(user_dir))
-            if '*' in text:
+            if not files:
+                return msg.reply("📁 Папка пуста").send()
+
+            if len(parts) > 1 and parts[1].isdigit():
+                idx = int(parts[1]) - 1
+                if 0 <= idx < len(files):
+                    f = files[idx]
+                    msg.reply(f"🔗 {self.base_url}/{user_hash}/{self.safe_quote(f)}").send()
+                else:
+                    msg.reply("❌ Некорректный номер файла.").send()
+            else:
+                msg.reply("📖 Используйте: lnk <номер файла>").send()
+
+        # Команда удаления файлов
+        elif cmd == 'rm':
+            files = sorted(os.listdir(user_dir))
+            if '*' in parts or (len(parts) > 1 and parts[1] == '*'):
                 for f in files:
                     os.remove(os.path.join(user_dir, f))
                 msg.reply("🗑 Очищено.").send()
+            elif len(parts) > 1 and parts[1].isdigit():
+                idx = int(parts[1]) - 1
+                if 0 <= idx < len(files):
+                    f = files[idx]
+                    os.remove(os.path.join(user_dir, f))
+                    msg.reply(f"🗑 Удалено: {f}").send()
+                else:
+                    msg.reply("❌ Некорректный номер файла.").send()
+
+        # Админ-команды для управления белым списком
+        if ADMIN_JID and msg['from'].bare == ADMIN_JID:
+            parts = msg['body'].split()
+            cmd = parts[0].lower()
+            if cmd == 'add' and len(parts) > 1:
+                entry = parts[1]
+                self.whitelist.add(entry)
+                self.save_whitelist()
+                msg.reply(f"➕ Добавлено: {entry}").send()
+            elif cmd == 'del' and len(parts) > 1:
+                entry = parts[1]
+                if entry in self.whitelist:
+                    self.whitelist.remove(entry)
+                    self.save_whitelist()
+                    msg.reply(f"➖ Удалено: {entry}").send()
+                else:
+                    msg.reply(f"❓ Не найдено: {entry}").send()
+            elif cmd == 'list':
+                res = "\n".join(sorted(self.whitelist))
+                msg.reply(f"📄 Белый список:\n{res or '(пусто)'}").send()
 
     # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
     def handle_raw_si(self, iq):
+        # Проверка белого списка
+        if not self.is_allowed(iq['from']):
+            return iq.reply(type='error').send()
+
         try:
             # Находим элемент <si>
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
@@ -294,22 +407,35 @@ class OBBFastBot(ClientXMPP):
 
             # Если всё получили полностью — сообщаем пользователю ссылку
             if received == file_info['size']:
+                safe_name = self.safe_quote(file_info['name'])
                 self.send_message(
                     mto=peer_jid,
-                    mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{urllib.parse.quote(file_info['name'])}",
+                    mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_name}",
                     mtype='chat'
                 )
+            else:
+                # Если файл не докачан — удаляем его, чтобы не занимал квоту
+                if os.path.exists(path):
+                    os.remove(path)
 
-        except:
-            # При любой ошибке просто завершаем задачу (файл может быть битым)
-            pass
+        except Exception as e:
+            # При любой ошибке удаляем файл
+            logging.error(f"Ошибка при приёме файла: {e}")
+            if os.path.exists(path):
+                os.remove(path)
 
 
 # Точка входа — основная асинхронная функция
 async def main():
+    # Формируем JID с ресурсом, если он указан
+    jid = os.getenv('XMPP_JID')
+    resource = os.getenv('XMPP_RESOURCE')
+    if resource:
+        jid = f"{jid}/{resource}"
+
     # Создаём экземпляр бота, передавая параметры из переменных окружения
     bot = OBBFastBot(
-        os.getenv('XMPP_JID'),
+        jid,
         os.getenv('XMPP_PASSWORD'),
         os.getenv('DOWNLOAD_DIR'),
         os.getenv('BASE_URL')
@@ -322,7 +448,9 @@ async def main():
     bot.disabled_sasl_mechanisms = {'DIGEST-MD5', 'SCRAM-SHA-1-PLUS'}
 
     # Запускаем соединение с указанным сервером и портом
-    bot.connect((os.getenv('XMPP_HOST', 'jabberworld.info'), 5222))
+    xmpp_host = os.getenv('XMPP_HOST', 'jabberworld.info')
+    xmpp_port = int(os.getenv('XMPP_PORT', 5222))
+    bot.connect((xmpp_host, xmpp_port))
 
     # Ждём отключения (работаем до разрыва соединения)
     await bot.disconnected
