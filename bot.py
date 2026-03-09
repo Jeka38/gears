@@ -583,6 +583,10 @@ class OBBFastBot(ClientXMPP):
         logging.info(f"JINGLE {action} from {iq['from']}, sid={sid}")
 
         if action == 'session-initiate':
+            # Проверка белого списка
+            if not self.is_allowed(iq['from']):
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+
             # Парсим описание файла (XEP-0234)
             content = jingle.find('{urn:xmpp:jingle:1}content')
             description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
@@ -591,6 +595,13 @@ class OBBFastBot(ClientXMPP):
             fname = file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}name').text
             fsize = int(file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}size').text)
             fname = os.path.basename(fname).replace(' ', '_')
+
+            # Проверка квоты
+            user_dir, _ = self.get_user_info(iq['from'])
+            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                logging.info(f"QUOTA EXCEEDED (Jingle) for {iq['from']}")
+                self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
 
             # Запоминаем инфо
             self.pending_files[sid] = {
@@ -609,32 +620,42 @@ class OBBFastBot(ClientXMPP):
                 'initiator': iq['from'].full
             })
 
-            # Копируем структуру content/description/transport
             res_content = ET.SubElement(res_jingle, '{urn:xmpp:jingle:1}content', {
                 'creator': content.get('creator'),
                 'name': content.get('name')
             })
             res_content.append(description)
 
-            # Выбираем транспорт (предпочитаем S5B если есть, иначе IBB)
-            transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
-            if transport is not None:
+            # Проверяем транспорты
+            s5b_transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+            ibb_transport = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+
+            if s5b_transport is not None:
+                # SOCKS5 Jingle (XEP-0260)
                 res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:s5b:1}transport', {
-                    'sid': transport.get('sid')
+                    'sid': s5b_transport.get('sid')
                 })
-            else:
-                transport = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+                # Собираем кандидатов
+                candidates = []
+                for cand in s5b_transport.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
+                    candidates.append({
+                        'host': cand.get('host'),
+                        'port': int(cand.get('port', 1080)),
+                        'jid': cand.get('jid')
+                    })
+                # Пытаемся подключиться
+                asyncio.create_task(self._socks5_connect_and_save(sid, iq['from'], candidates))
+
+            elif ibb_transport is not None:
+                # IBB Jingle (XEP-0261)
                 res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:ibb:1}transport', {
-                    'sid': transport.get('sid'),
-                    'block-size': transport.get('block-size')
+                    'sid': ibb_transport.get('sid'),
+                    'block-size': ibb_transport.get('block-size', '4096')
                 })
+                # IBB запустится через ibb_stream_start event
 
             reply.append(res_jingle)
             reply.send()
-
-            # Если это S5B - запускаем ожидание подключения
-            if transport.tag.endswith('s5b:1}transport'):
-                asyncio.create_task(self._manual_socks5_connect(iq))
 
         elif action == 'session-terminate':
             if sid in self.pending_files:
@@ -654,106 +675,113 @@ class OBBFastBot(ClientXMPP):
 
     # Асинхронная функция подключения по SOCKS5 и приёма файла
     async def _manual_socks5_connect(self, iq):
-        sid = None
         try:
             query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
             if query is None:
                 logging.error(f"SOCKS5: Query element not found in IQ: {iq}")
                 return
             sid = query.get('sid')
-            file_info = self.pending_files.get(sid)
 
+            # Собираем список хостов из SI запроса
+            hosts = []
+            for host in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
+                hosts.append({
+                    'host': host.get('host'),
+                    'port': int(host.get('port', 1080)),
+                    'jid': host.get('jid')
+                })
+
+            # Запускаем общую логику подключения
+            success = await self._socks5_connect_and_save(sid, iq['from'], hosts, iq_for_si_reply=iq)
+
+            if not success:
+                # Если ни один прокси не сработал — ошибка SI
+                if not hosts:
+                    self.send_message(
+                        mto=iq['from'].bare,
+                        mbody="⚠ Не найдено доступных путей для передачи (SOCKS5). "
+                              "Бот пробует переключиться на Jingle/IBB...",
+                        mtype='chat'
+                    )
+                reply = iq.reply()
+                reply['type'] = 'error'
+                # Предлагаем клиенту попробовать Jingle (XEP-0166)
+                reply['error']['condition'] = 'item-not-found'
+                reply['error']['text'] = 'SOCKS5 failed, trying Jingle fallback'
+                reply.send()
+
+        except Exception as e:
+            logging.error(f"SOCKS5 SI ERROR: {e}")
+
+    # Общая логика SOCKS5 (для SI и Jingle)
+    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None):
+        try:
+            file_info = self.pending_files.get(sid)
             if not file_info:
                 logging.warning(f"SOCKS5: Unknown SID {sid}")
-                return
+                return False
 
-            # Вычисляем адрес SOCKS5 в соответствии со спецификацией
+            # Вычисляем адрес SOCKS5 (SHA1 от SID + Initiator JID + Target JID)
+            # В SI: initiator - отправитель, target - бот
+            # В Jingle FT: initiator - отправитель, target - бот
             dst_addr = hashlib.sha1(
-                f"{sid}{iq['from'].full}{self.boundjid.full}".encode()
+                f"{sid}{peer_jid.full}{self.boundjid.full}".encode()
             ).hexdigest()
             logging.info(f"SOCKS5: Calculated dst_addr={dst_addr} for sid={sid}")
 
-            # Пробуем каждый предложенный streamhost по очереди
-            hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
-            logging.info(f"SOCKS5: Found {len(hosts)} streamhosts")
+            logging.info(f"SOCKS5: Found {len(hosts)} streamhosts/candidates")
             for host in hosts:
-                h_host, h_port, h_jid = host.get('host'), int(host.get('port', 1080)), host.get('jid')
-                logging.info(f"SOCKS5: Trying host {h_host}:{h_port} ({h_jid})")
+                h_host, h_port, h_jid = host['host'], host['port'], host['jid']
+                logging.info(f"SOCKS5: Trying {h_host}:{h_port} ({h_jid})")
                 try:
-                    # Устанавливаем TCP-соединение
-                    logging.info(f"SOCKS5: Opening connection to {h_host}:{h_port}")
                     reader, writer = await asyncio.wait_for(
                         asyncio.open_connection(h_host, h_port),
                         5
                     )
                     logging.info(f"SOCKS5: TCP connected to {h_host}:{h_port}")
 
-                    # SOCKS5 handshake: без аутентификации
+                    # Handshake
                     writer.write(b"\x05\x01\x00")
                     await writer.drain()
+                    if (await reader.read(2)) != b"\x05\x00":
+                        writer.close(); continue
 
-                    handshake_resp = await reader.read(2)
-                    if handshake_resp != b"\x05\x00":
-                        logging.warning(f"SOCKS5: Handshake failed for {h_host}: {handshake_resp}")
-                        writer.close()
-                        continue
-
-                    # Запрос на соединение с вычисленным адресом
+                    # Connect
                     writer.write(b"\x05\x01\x00\x03" + bytes([len(dst_addr)]) + dst_addr.encode() + b"\x00\x00")
                     await writer.drain()
-
                     resp = await reader.read(4)
                     if not resp or resp[1] != 0x00:
-                        logging.warning(f"SOCKS5: Connection request failed for {h_host}: {resp}")
-                        writer.close()
-                        continue
+                        writer.close(); continue
 
-                    # Пропускаем остаток ответа в зависимости от типа адреса
+                    # Skip remain resp
                     atyp = resp[3]
-                    if atyp == 0x01:    await reader.read(6)
-                    elif atyp == 0x03:  addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
-                    elif atyp == 0x04:  await reader.read(18)
+                    if atyp == 0x01: await reader.read(6)
+                    elif atyp == 0x03: a_len = await reader.read(1); await reader.read(a_len[0] + 2)
+                    elif atyp == 0x04: await reader.read(18)
 
-                    # Отвечаем, что используем именно этот streamhost
-                    logging.info(f"SOCKS5: Connected to {h_host}, sending streamhost-used")
-                    reply = iq.reply()
-                    res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                    ET.SubElement(res_q, 'streamhost-used', jid=h_jid)
-                    reply.append(res_q)
-                    reply.send()
+                    logging.info(f"SOCKS5: Connected to {h_host}")
 
-                    # Запускаем приём файла
-                    await self.save_file_task(reader, file_info, iq['from'])
+                    # Для SI нужно отправить подтверждение streamhost-used
+                    if iq_for_si_reply:
+                        reply = iq_for_si_reply.reply()
+                        res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                        ET.SubElement(res_q, 'streamhost-used', jid=h_jid)
+                        reply.append(res_q)
+                        reply.send()
 
+                    await self.save_file_task(reader, file_info, peer_jid)
                     writer.close()
                     await writer.wait_closed()
-                    return
+                    return True
 
-                except asyncio.TimeoutError:
-                    logging.warning(f"SOCKS5: Timeout connecting to {h_host}:{h_port}")
-                    continue
                 except Exception as e:
-                    logging.warning(f"SOCKS5: Error with host {h_host}: {e}")
+                    logging.warning(f"SOCKS5: Error with {h_host}: {e}")
                     continue
 
-            # Если ни один прокси не сработал — ошибка
-            logging.error(f"SOCKS5: All streamhosts failed for sid={sid}")
-            if not hosts:
-                self.send_message(
-                    mto=iq['from'].bare,
-                    mbody="⚠ Не найдено доступных путей для передачи (SOCKS5). "
-                          "Бот пробует переключиться на Jingle/IBB...",
-                    mtype='chat'
-                )
-            reply = iq.reply()
-            reply['type'] = 'error'
-            # Предлагаем клиенту попробовать Jingle (XEP-0166)
-            reply['error']['condition'] = 'item-not-found'
-            reply['error']['text'] = 'SOCKS5 failed, trying Jingle fallback'
-            reply.send()
-
+            return False
         except Exception as e:
-            logging.error(f"SOCKS5 ERROR: {e}")
+            logging.error(f"SOCKS5 GENERIC ERROR: {e}")
+            return False
         finally:
             if sid in self.pending_files:
                 del self.pending_files[sid]
