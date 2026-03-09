@@ -193,6 +193,12 @@ class OBBFastBot(ClientXMPP):
         return "".join(c if ord(c) >= 128 or c.isalnum() or c in '._-~/:?=&'
                        else urllib.parse.quote(c) for c in text)
 
+    def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
+                     mfrom=None, mnick=None):
+        if mbody and not mbody.startswith('\n'):
+            mbody = '\n' + mbody
+        super().send_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
+
     # Получаем (и при необходимости создаём) персональную папку пользователя
     def get_user_info(self, jid):
         # Берём bare JID (без ресурса) и считаем от него md5
@@ -217,14 +223,23 @@ class OBBFastBot(ClientXMPP):
         return sum(os.path.getsize(os.path.join(d, f))
                    for d, _, fs in os.walk(path) for f in fs)
 
-    # Форматируем размер в человеко-читаемый вид (B → KB → MB → GB)
+    # Форматируем размер в человеко-читаемый вид (B → kB → MB → GB)
     def format_size(self, size):
-        for unit in ['B', 'KB', 'MB', 'GB']:
+        for unit in ['B', 'kB', 'MB', 'GB']:
             if size < 1024:
-                return f"{size:.2f} {unit}"
+                return f"{size:.1f}{unit}"
             size /= 1024
-        # На случай очень больших чисел (маловероятно)
-        return f"{size:.2f} GB"
+        return f"{size:.1f}GB"
+
+    def get_help_text(self):
+        return (
+            "команды:\n"
+            "ls - список ссылок на файлы в папке пользователя.\n"
+            "ls <-s> - простой список файлов. Пример: ls -s\n"
+            "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
+            "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
+            "help или ? - список команд."
+        )
 
     # Обработчик запроса на подписку
     def handle_presence_subscribe(self, presence):
@@ -239,6 +254,10 @@ class OBBFastBot(ClientXMPP):
         self.send_presence(pto=jid, ptype='subscribed')
         # И подписываемся в ответ
         self.send_presence(pto=jid, ptype='subscribe')
+
+        # Приветственное сообщение
+        welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text()}"
+        self.send_message(mto=jid, mbody=welcome_msg, mtype='chat')
 
     # Обработчик подтверждения подписки
     def handle_presence_subscribed(self, presence):
@@ -283,90 +302,110 @@ class OBBFastBot(ClientXMPP):
         # Получаем папку и хеш пользователя
         user_dir, user_hash = self.get_user_info(msg['from'])
 
+        # Вспомогательная функция для ответов с новой строки
+        def reply(text):
+            self.send_message(mto=msg['from'], mbody=text, mtype='chat')
+
         # Команда помощи
-        if cmd in ('help', '?', '🛠'):
+        if cmd in ('help', '?'):
+            if len(parts) != 1: return
             used = self.get_dir_size(user_dir)
-            help_text = (
-                f"📖 Команды:\nls, ls -s, rm <№|*>, lnk <№>, help, ping, version\n\n"
-                f"📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}\n"
-            )
-            if ADMIN_JID and msg['from'].bare == ADMIN_JID:
-                help_text += f"\n🔧 Админ-команды:\nadd <jid|domain|*>, del <jid|domain|*>, list\n"
-            msg.reply(help_text).send()
-
-        # Команда пинга
-        elif cmd == 'ping':
-            msg.reply("pong").send()
-
-        # Команда версии
-        elif cmd == 'version':
-            msg.reply(f"OBBFastBot v{VERSION}").send()
+            help_text = self.get_help_text() + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
+            reply(help_text)
 
         # Команда показа списка файлов
         elif cmd == 'ls':
+            if len(parts) > 2: return
             files = sorted(os.listdir(user_dir))
             if not files:
-                return msg.reply("📁 Папка пуста").send()
+                return reply("📁 Папка пуста")
 
-            short = '-s' in parts  # короткий формат (только имена)
-            res = ["Список файлов:"]
+            if len(parts) == 2:
+                if parts[1] == '-s':
+                    res = []
+                    for i, f in enumerate(files):
+                        size = os.path.getsize(os.path.join(user_dir, f))
+                        res.append(f"{i+1} - {f} [{self.format_size(size)}]")
+                    reply("\n".join(res))
+                return
+
+            # По умолчанию (просто ls) - список ссылок
+            res = []
             for i, f in enumerate(files):
-                if short:
-                    res.append(f"{i+1}. {f}")
-                else:
-                    res.append(f"{i+1}. {f} | {self.base_url}/{user_hash}/{self.safe_quote(f)}")
-            msg.reply("\n".join(res)).send()
+                res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+            reply("\n".join(res))
 
         # Команда получения ссылки на файл
-        elif cmd == 'lnk':
+        elif cmd in ('link', 'lnk'):
+            if len(parts) != 2: return
             files = sorted(os.listdir(user_dir))
             if not files:
-                return msg.reply("📁 Папка пуста").send()
+                return reply("📁 Папка пуста")
 
-            if len(parts) > 1 and parts[1].isdigit():
-                idx = int(parts[1]) - 1
-                if 0 <= idx < len(files):
-                    f = files[idx]
-                    msg.reply(f"🔗 {self.base_url}/{user_hash}/{self.safe_quote(f)}").send()
-                else:
-                    msg.reply("❌ Некорректный номер файла.").send()
+            if parts[1] == '*':
+                res = []
+                for i, f in enumerate(files):
+                    res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+                reply("\n".join(res))
             else:
-                msg.reply("📖 Используйте: lnk <номер файла>").send()
+                try:
+                    indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())))
+                except ValueError: return
+
+                res = []
+                for idx in indices:
+                    if 0 <= idx < len(files):
+                        f = files[idx]
+                        res.append(f"{idx+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+                if res:
+                    reply("\n".join(res))
 
         # Команда удаления файлов
         elif cmd == 'rm':
+            if len(parts) != 2: return
             files = sorted(os.listdir(user_dir))
-            if '*' in parts or (len(parts) > 1 and parts[1] == '*'):
+            if not files:
+                return reply("📁 Папка пуста")
+
+            if parts[1] == '*':
                 for f in files:
                     os.remove(os.path.join(user_dir, f))
-                msg.reply("🗑 Очищено.").send()
-            elif len(parts) > 1 and parts[1].isdigit():
-                idx = int(parts[1]) - 1
-                if 0 <= idx < len(files):
-                    f = files[idx]
-                    os.remove(os.path.join(user_dir, f))
-                    msg.reply(f"🗑 Удалено: {f}").send()
-                else:
-                    msg.reply("❌ Некорректный номер файла.").send()
+                reply("🗑 Все файлы удалены.")
+            else:
+                try:
+                    indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())), reverse=True)
+                except ValueError: return
+
+                removed = []
+                for idx in indices:
+                    if 0 <= idx < len(files):
+                        f = files[idx]
+                        try:
+                            os.remove(os.path.join(user_dir, f))
+                            removed.append(f)
+                        except OSError:
+                            pass
+                if removed:
+                    reply(f"🗑 Удалено файлов: {len(removed)}")
 
         # Админ-команды для управления белым списком
         if ADMIN_JID and msg['from'].bare == ADMIN_JID:
-            if cmd == 'add' and len(parts) > 1:
+            if cmd == 'add' and len(parts) == 2:
                 entry = parts[1].lower()
                 self.whitelist.add(entry)
                 self.save_whitelist()
-                msg.reply(f"➕ Добавлено: {entry}").send()
-            elif cmd == 'del' and len(parts) > 1:
+                reply(f"➕ Добавлено: {entry}")
+            elif cmd == 'del' and len(parts) == 2:
                 entry = parts[1].lower()
                 if entry in self.whitelist:
                     self.whitelist.remove(entry)
                     self.save_whitelist()
-                    msg.reply(f"➖ Удалено: {entry}").send()
+                    reply(f"➖ Удалено: {entry}")
                 else:
-                    msg.reply(f"❓ Не найдено: {entry}").send()
-            elif cmd == 'list':
+                    reply(f"❓ Не найдено: {entry}")
+            elif cmd == 'list' and len(parts) == 1:
                 res = "\n".join(sorted(self.whitelist))
-                msg.reply(f"📄 Белый список:\n{res or '(пусто)'}").send()
+                reply(f"📄 Белый список:\n{res or '(пусто)'}")
 
     # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
     def handle_raw_si(self, iq):
