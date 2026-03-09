@@ -75,7 +75,7 @@ class OBBFastBot(ClientXMPP):
         self.register_plugin('xep_0199')
         # Регистрируем плагин XEP-0092 (Software Version)
         self.register_plugin('xep_0092')
-        self['xep_0092'].software_name = 'OBBFastBot'
+        self['xep_0092'].software_name = os.getenv('APP_NAME', 'OBBFastBot')
         self['xep_0092'].version = VERSION
 
         # Подписываемся на событие успешного входа в сеть
