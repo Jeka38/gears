@@ -293,8 +293,6 @@ class OBBFastBot(ClientXMPP):
 
         # Админ-команды для управления белым списком
         if ADMIN_JID and msg['from'].bare == ADMIN_JID:
-            parts = msg['body'].split()
-            cmd = parts[0].lower()
             if cmd == 'add' and len(parts) > 1:
                 entry = parts[1].lower()
                 self.whitelist.add(entry)
@@ -329,7 +327,9 @@ class OBBFastBot(ClientXMPP):
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
 
             # Имя и размер файла, который хочет отправить собеседник
-            fname, fsize = tag.get('name'), int(tag.get('size', 0))
+            # Санитизируем имя файла для предотвращения Path Traversal
+            fname = os.path.basename(tag.get('name'))
+            fsize = int(tag.get('size', 0))
             logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
 
             user_dir, _ = self.get_user_info(iq['from'])
@@ -470,7 +470,9 @@ class OBBFastBot(ClientXMPP):
     # Асинхронная функция непосредственного приёма данных файла
     async def download_file_task(self, reader, file_info, peer_jid):
         user_dir, user_hash = self.get_user_info(peer_jid)
-        path = os.path.join(user_dir, file_info['name'])
+        # Санитизируем имя файла ещё раз при формировании пути
+        fname = os.path.basename(file_info['name'])
+        path = os.path.join(user_dir, fname)
         received = 0
         logging.info(f"DOWNLOAD START: {file_info['name']} to {path}")
 
