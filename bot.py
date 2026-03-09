@@ -577,6 +577,7 @@ class OBBFastBot(ClientXMPP):
 
     # Обработчик Jingle (XEP-0166)
     def handle_jingle(self, iq):
+        logging.info(f"JINGLE XML RECV: {iq}")
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         action = jingle.get('action')
         sid = jingle.get('sid')
@@ -655,6 +656,7 @@ class OBBFastBot(ClientXMPP):
                 # IBB запустится через ibb_stream_start event
 
             reply.append(res_jingle)
+            logging.info(f"JINGLE XML SEND (session-accept): {reply}")
             reply.send()
 
         elif action == 'session-terminate':
