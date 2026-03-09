@@ -19,9 +19,14 @@ import json
 # Импорт модуля для корректной работы с URL (в частности quote для имён файлов)
 import urllib.parse
 
+# Импорт модуля aiohttp для реализации HTTP Upload
+from aiohttp import web
+
 # Импорт функции для загрузки переменных окружения из .env файла
 from dotenv import load_dotenv
 
+# Импорт библиотеки slixmpp
+import slixmpp
 # Импорт основного класса XMPP-клиента из библиотеки slixmpp
 from slixmpp import ClientXMPP
 
@@ -66,7 +71,6 @@ class OBBFastBot(ClientXMPP):
 
         # Словарь для хранения информации о файлах, которые сейчас передаются
         self.pending_files = {}
-        asyncio.create_task(self.cleanup_pending_files())
 
         # Белый список
         self.whitelist = set()
@@ -86,7 +90,6 @@ class OBBFastBot(ClientXMPP):
         self.register_plugin('xep_0092')
         self['xep_0092'].software_name = os.getenv('APP_NAME', 'OBBFastBot')
         # Версия в стиле: OBBFastBot 1.1 on Python 3.12.12 + slixmpp
-        import slixmpp
         self['xep_0092'].version = f"{VERSION} on Python {platform.python_version()} + slixmpp {slixmpp.__version__}"
 
         # Регистрируем плагины для передачи файлов
@@ -131,6 +134,11 @@ class OBBFastBot(ClientXMPP):
             matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:jingle:1}jingle'),
             self.handle_jingle))
 
+        # Явный обработчик для HTTP Upload (XEP-0363)
+        self.register_handler(handler.Callback('HTTPUpload',
+            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:http:upload:0}request'),
+            self.handle_http_upload))
+
     # Асинхронный цикл очистки зависших передач
     async def cleanup_pending_files(self):
         while True:
@@ -147,6 +155,9 @@ class OBBFastBot(ClientXMPP):
 
     # Асинхронный обработчик события успешного входа в аккаунт
     async def start(self, event):
+        # Запускаем очистку зависших передач
+        asyncio.create_task(self.cleanup_pending_files())
+
         # Сообщаем серверу, что мы поддерживаем SI (Stream Initiation)
         self['xep_0030'].add_feature('http://jabber.org/protocol/si')
 
@@ -158,6 +169,16 @@ class OBBFastBot(ClientXMPP):
 
         # Поддержка IBB
         self['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
+
+        # Поддержка HTTP Upload (XEP-0363)
+        self['xep_0030'].add_feature('urn:xmpp:http:upload:0')
+
+        # Поддержка Jingle
+        self['xep_0030'].add_feature('urn:xmpp:jingle:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ice-udp:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
 
         # Отправляем присутствие (online)
         self.send_presence()
@@ -565,14 +586,8 @@ class OBBFastBot(ClientXMPP):
         file_info = self.pending_files.get(sid)
         if file_info:
             logging.info(f"IBB STREAM START: sid={sid}")
-            asyncio.create_task(self.save_file_task(stream, file_info, file_info['from']))
+            asyncio.create_task(self.save_file_task(stream, file_info, file_info['from'], sid_to_clean=sid))
         else:
-            # Пробуем найти по Jingle SID
-            for info in self.pending_files.values():
-                if info.get('jingle_sid') == sid:
-                    logging.info(f"IBB STREAM START (Jingle): sid={sid}")
-                    asyncio.create_task(self.save_file_task(stream, info, info['from']))
-                    return
             logging.warning(f"IBB STREAM: Unknown SID {sid}")
 
     # Обработчик Jingle (XEP-0166)
@@ -604,14 +619,15 @@ class OBBFastBot(ClientXMPP):
                 self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
                 reply = iq.reply(); reply['type'] = 'error'; return reply.send()
 
-            # Запоминаем инфо
-            self.pending_files[sid] = {
+            # Запоминаем инфо (ключ — Jingle Session ID)
+            file_info = {
                 'name': fname,
                 'size': fsize,
                 'from': iq['from'].bare,
                 'jingle_sid': sid,
                 'timestamp': asyncio.get_event_loop().time()
             }
+            self.pending_files[sid] = file_info
 
             # Соглашаемся (session-accept)
             reply = iq.reply()
@@ -633,8 +649,12 @@ class OBBFastBot(ClientXMPP):
 
             if s5b_transport is not None:
                 # SOCKS5 Jingle (XEP-0260)
+                s5b_sid = s5b_transport.get('sid')
+                # Связываем S5B SID с информацией о файле
+                self.pending_files[s5b_sid] = file_info
+
                 res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:s5b:1}transport', {
-                    'sid': s5b_transport.get('sid')
+                    'sid': s5b_sid
                 })
                 # Собираем кандидатов
                 candidates = []
@@ -642,15 +662,24 @@ class OBBFastBot(ClientXMPP):
                     candidates.append({
                         'host': cand.get('host'),
                         'port': int(cand.get('port', 1080)),
-                        'jid': cand.get('jid')
+                        'jid': cand.get('jid'),
+                        'cid': cand.get('cid')
                     })
                 # Пытаемся подключиться
-                asyncio.create_task(self._socks5_connect_and_save(sid, iq['from'], candidates))
+                ctx = {
+                    'sid': sid,
+                    'creator': content.get('creator'),
+                    'name': content.get('name')
+                }
+                asyncio.create_task(self._socks5_connect_and_save(s5b_sid, iq['from'], candidates, jingle_ctx=ctx))
 
             elif ibb_transport is not None:
                 # IBB Jingle (XEP-0261)
+                ibb_sid = ibb_transport.get('sid')
+                self.pending_files[ibb_sid] = file_info
+
                 res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:ibb:1}transport', {
-                    'sid': ibb_transport.get('sid'),
+                    'sid': ibb_sid,
                     'block-size': ibb_transport.get('block-size', '4096')
                 })
                 # IBB запустится через ibb_stream_start event
@@ -659,10 +688,65 @@ class OBBFastBot(ClientXMPP):
             logging.info(f"JINGLE XML SEND (session-accept): {reply}")
             reply.send()
 
+        elif action == 'transport-info':
+            # Дополнительные кандидаты или подтверждение выбора (candidate-used)
+            # В простейшей реализации просто отвечаем ack
+            iq.reply().send()
+
         elif action == 'session-terminate':
             if sid in self.pending_files:
                 del self.pending_files[sid]
             iq.reply().send()
+
+    # Обработчик запроса на HTTP Upload (XEP-0363)
+    def handle_http_upload(self, iq):
+        try:
+            req = iq.xml.find('{urn:xmpp:http:upload:0}request')
+            fname = req.get('filename')
+            fsize = int(req.get('size', 0))
+
+            # Санитизируем
+            fname = os.path.basename(fname).replace(' ', '_')
+
+            # Проверка белого списка
+            if not self.is_allowed(iq['from']):
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+
+            # Проверка квоты
+            user_dir, user_hash = self.get_user_info(iq['from'])
+            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+
+            # Генерируем уникальный токен для PUT
+            token = hashlib.sha256(f"{iq['from'].full}{fname}{fsize}{asyncio.get_event_loop().time()}".encode()).hexdigest()[:16]
+
+            # Запоминаем для сопоставления при PUT запросе
+            self.pending_files[token] = {
+                'name': fname,
+                'size': fsize,
+                'from': iq['from'].bare,
+                'timestamp': asyncio.get_event_loop().time()
+            }
+
+            # Формируем ответ со ссылками
+            reply = iq.reply()
+            slot = ET.Element('{urn:xmpp:http:upload:0}slot')
+
+            put_url = f"{self.base_url}/upload/{token}/{fname}"
+            get_url = f"{self.base_url}/{user_hash}/{self.safe_quote(fname)}"
+
+            put = ET.SubElement(slot, 'put')
+            put.set('url', put_url)
+
+            get = ET.SubElement(slot, 'get')
+            get.set('url', get_url)
+
+            reply.append(slot)
+            reply.send()
+            logging.info(f"HTTP UPLOAD slot generated for {fname} ({fsize} bytes)")
+
+        except Exception as e:
+            logging.error(f"HTTP UPLOAD ERROR: {e}")
 
 
     # Обработчик XMPP Ping
@@ -716,7 +800,7 @@ class OBBFastBot(ClientXMPP):
             logging.error(f"SOCKS5 SI ERROR: {e}")
 
     # Общая логика SOCKS5 (для SI и Jingle)
-    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None):
+    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None, jingle_ctx=None):
         try:
             file_info = self.pending_files.get(sid)
             if not file_info:
@@ -734,6 +818,7 @@ class OBBFastBot(ClientXMPP):
             logging.info(f"SOCKS5: Found {len(hosts)} streamhosts/candidates")
             for host in hosts:
                 h_host, h_port, h_jid = host['host'], host['port'], host['jid']
+                h_cid = host.get('cid') # Только для Jingle
                 logging.info(f"SOCKS5: Trying {h_host}:{h_port} ({h_jid})")
                 try:
                     reader, writer = await asyncio.wait_for(
@@ -771,7 +856,27 @@ class OBBFastBot(ClientXMPP):
                         reply.append(res_q)
                         reply.send()
 
-                    await self.save_file_task(reader, file_info, peer_jid)
+                    # Для Jingle отправляем transport-info (candidate-used)
+                    if jingle_ctx and h_cid:
+                        info_iq = self.Iq(mto=peer_jid.full, mtype='set')
+                        j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                            'action': 'transport-info',
+                            'sid': jingle_ctx['sid'],
+                            'initiator': peer_jid.full
+                        })
+                        c = ET.SubElement(j, '{urn:xmpp:jingle:1}content', {
+                            'creator': jingle_ctx['creator'],
+                            'name': jingle_ctx['name']
+                        })
+                        t = ET.SubElement(c, '{urn:xmpp:jingle:transports:s5b:1}transport', {
+                            'sid': sid
+                        })
+                        ET.SubElement(t, 'candidate-used', cid=h_cid)
+                        info_iq.append(j)
+                        info_iq.send()
+                        logging.info(f"JINGLE transport-info (candidate-used) SENT for cid={h_cid}")
+
+                    await self.save_file_task(reader, file_info, peer_jid, sid_to_clean=sid)
                     writer.close()
                     await writer.wait_closed()
                     return True
@@ -784,12 +889,9 @@ class OBBFastBot(ClientXMPP):
         except Exception as e:
             logging.error(f"SOCKS5 GENERIC ERROR: {e}")
             return False
-        finally:
-            if sid in self.pending_files:
-                del self.pending_files[sid]
 
     # Асинхронная функция непосредственного приёма данных файла (общая для SOCKS5 и IBB)
-    async def save_file_task(self, stream, file_info, peer_jid):
+    async def save_file_task(self, stream, file_info, peer_jid, sid_to_clean=None):
         user_dir, user_hash = self.get_user_info(peer_jid)
         # Имя файла уже санитизировано в handle_raw_si
         fname = file_info['name']
@@ -810,11 +912,11 @@ class OBBFastBot(ClientXMPP):
 
                     if not chunk:
                         break
-                    f.write(chunk)
+                    await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
                     received += len(chunk)
 
                 f.flush()
-                os.fsync(f.fileno())
+                await asyncio.get_event_loop().run_in_executor(None, os.fsync, f.fileno())
 
             # Если всё получили полностью — сообщаем пользователю ссылку
             if received == file_info['size']:
@@ -834,7 +936,54 @@ class OBBFastBot(ClientXMPP):
             logging.error(f"Ошибка при приёме файла: {e}")
             if os.path.exists(path):
                 os.remove(path)
+        finally:
+            if sid_to_clean and sid_to_clean in self.pending_files:
+                del self.pending_files[sid_to_clean]
 
+
+# Обработчик PUT-запросов для HTTP Upload
+async def handle_upload_put(request):
+    token = request.match_info.get('token')
+    bot = request.app['bot']
+
+    info = bot.pending_files.get(token)
+    if not info:
+        return web.Response(status=404, text="Unknown token")
+
+    user_dir, user_hash = bot.get_user_info(slixmpp.JID(info['from']))
+    path = os.path.join(user_dir, info['name'])
+
+    logging.info(f"HTTP PUT upload started: {info['name']} for {info['from']}")
+
+    try:
+        def write_to_file():
+            with open(path, 'wb') as f:
+                # Читаем данные из запроса порциями
+                # request.content.read() - корутина, поэтому читаем снаружи и передаем
+                pass
+
+        # Поскольку request.content.read() асинхронный, мы не можем просто обернуть весь цикл в executor.
+        # Будем выполнять в executor только блокирующую операцию записи.
+        with open(path, 'wb') as f:
+            while True:
+                chunk = await request.content.read(1048576)
+                if not chunk:
+                    break
+                await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
+
+        # Уведомляем пользователя
+        bot.send_message(
+            mto=info['from'],
+            mbody=f"✅ Готово (HTTP)!\n{bot.base_url}/{user_hash}/{bot.safe_quote(info['name'])}",
+            mtype='chat'
+        )
+        del bot.pending_files[token]
+        return web.Response(status=201)
+
+    except Exception as e:
+        logging.error(f"HTTP PUT ERROR: {e}")
+        if os.path.exists(path): os.remove(path)
+        return web.Response(status=500)
 
 # Точка входа — основная асинхронная функция
 async def main():
@@ -862,6 +1011,18 @@ async def main():
     xmpp_host = os.getenv('XMPP_HOST', 'jabberworld.info')
     xmpp_port = int(os.getenv('XMPP_PORT', 5222))
     bot.connect((xmpp_host, xmpp_port))
+
+    # Настраиваем HTTP Upload сервер
+    app = web.Application()
+    app['bot'] = bot
+    app.router.add_put('/upload/{token}/{filename}', handle_upload_put)
+
+    upload_port = int(os.getenv('HTTP_UPLOAD_PORT', 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', upload_port)
+    await site.start()
+    logging.info(f"🌍 HTTP Upload server started on port {upload_port}")
 
     # Ждём отключения (работаем до разрыва соединения)
     await bot.disconnected
