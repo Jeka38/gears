@@ -60,6 +60,7 @@ class OBBFastBot(ClientXMPP):
 
         # Словарь для хранения информации о файлах, которые сейчас передаются
         self.pending_files = {}
+        asyncio.create_task(self.cleanup_pending_files())
 
         # Белый список
         self.whitelist = set()
@@ -74,6 +75,10 @@ class OBBFastBot(ClientXMPP):
         # Подписываемся на входящие сообщения (chat / normal)
         self.add_event_handler("message", self.handle_message)
 
+        # Обработчики для логирования XML
+        self.add_event_handler("xml_in", self.log_xml_in)
+        self.add_event_handler("xml_out", self.log_xml_out)
+
         # Регистрируем обработчик входящих SI (Stream Initiation) запросов
         self.register_handler(handler.Callback('SI',
             matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'),
@@ -83,6 +88,20 @@ class OBBFastBot(ClientXMPP):
         self.register_handler(handler.Callback('S5B',
             matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/bytestreams}query'),
             self.handle_raw_s5b))
+
+    # Асинхронный цикл очистки зависших передач
+    async def cleanup_pending_files(self):
+        while True:
+            try:
+                await asyncio.sleep(60)
+                now = asyncio.get_event_loop().time()
+                to_delete = [sid for sid, info in self.pending_files.items()
+                             if now - info.get('timestamp', now) > 600]
+                for sid in to_delete:
+                    logging.info(f"CLEANUP: Expiring pending file sid={sid}")
+                    del self.pending_files[sid]
+            except Exception as e:
+                logging.error(f"CLEANUP ERROR: {e}")
 
     # Асинхронный обработчик события успешного входа в аккаунт
     async def start(self, event):
@@ -117,6 +136,14 @@ class OBBFastBot(ClientXMPP):
         with open(WHITELIST_FILE, 'w') as f:
             for entry in sorted(self.whitelist):
                 f.write(f"{entry}\n")
+
+    # Логирование входящего XML
+    def log_xml_in(self, xml):
+        logging.info(f"RECV: {xml}")
+
+    # Логирование исходящего XML
+    def log_xml_out(self, xml):
+        logging.info(f"SEND: {xml}")
 
     # Проверяем, разрешён ли доступ данному JID
     def is_allowed(self, jid):
@@ -276,6 +303,7 @@ class OBBFastBot(ClientXMPP):
     def handle_raw_si(self, iq):
         # Проверка белого списка
         if not self.is_allowed(iq['from']):
+            logging.info(f"SI DENIED: {iq['from']}")
             reply = iq.reply()
             reply['type'] = 'error'
             return reply.send()
@@ -289,22 +317,28 @@ class OBBFastBot(ClientXMPP):
 
             # Имя и размер файла, который хочет отправить собеседник
             fname, fsize = tag.get('name'), int(tag.get('size', 0))
+            logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
 
             user_dir, _ = self.get_user_info(iq['from'])
 
             # Проверяем, хватит ли места в квоте
             if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                logging.info(f"QUOTA EXCEEDED for {iq['from']}")
                 self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
                 reply = iq.reply()
                 reply['type'] = 'error'
                 return reply.send()
 
             # Запоминаем информацию о файле, который сейчас будут передавать
-            self.pending_files[sid] = {'name': fname, 'size': fsize}
+            self.pending_files[sid] = {
+                'name': fname,
+                'size': fsize,
+                'timestamp': asyncio.get_event_loop().time()
+            }
 
             # Формируем ответ: соглашаемся на SOCKS5
             reply = iq.reply()
-            res_si = ET.Element('{http://jabber.org/protocol/si}si')
+            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, 'field', var='stream-method')
@@ -313,36 +347,43 @@ class OBBFastBot(ClientXMPP):
             reply.append(res_si)
             reply.send()
 
-        except:
+        except Exception as e:
+            logging.error(f"SI ERROR: {e}")
             # Если что-то сломалось — молча игнорируем (не отвечаем)
             pass
 
     # Обработчик входящего запроса SOCKS5 Bytestreams
     def handle_raw_s5b(self, iq):
+        logging.info(f"S5B REQUEST from {iq['from']}")
         # Запускаем асинхронную задачу обработки SOCKS5
         asyncio.create_task(self._manual_socks5_connect(iq))
 
     # Асинхронная функция подключения по SOCKS5 и приёма файла
     async def _manual_socks5_connect(self, iq):
+        sid = None
         try:
             query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
             sid = query.get('sid')
             file_info = self.pending_files.get(sid)
 
             if not file_info:
+                logging.warning(f"SOCKS5: Unknown SID {sid}")
                 return
 
             # Вычисляем адрес SOCKS5 в соответствии со спецификацией
             dst_addr = hashlib.sha1(
                 f"{sid}{iq['from'].full}{self.boundjid.full}".encode()
             ).hexdigest()
+            logging.info(f"SOCKS5: Calculated dst_addr={dst_addr} for sid={sid}")
 
             # Пробуем каждый предложенный streamhost по очереди
             for host in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
+                h_host, h_port, h_jid = host.get('host'), int(host.get('port', 1080)), host.get('jid')
+                logging.info(f"SOCKS5: Trying host {h_host}:{h_port} ({h_jid})")
                 try:
                     # Устанавливаем TCP-соединение
                     reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(host.get('host'), int(host.get('port', 1080))),
+                        asyncio.open_connection(h_host, h_port),
                         5
                     )
 
@@ -350,7 +391,9 @@ class OBBFastBot(ClientXMPP):
                     writer.write(b"\x05\x01\x00")
                     await writer.drain()
 
-                    if (await reader.read(2)) != b"\x05\x00":
+                    handshake_resp = await reader.read(2)
+                    if handshake_resp != b"\x05\x00":
+                        logging.warning(f"SOCKS5: Handshake failed for {h_host}: {handshake_resp}")
                         writer.close()
                         continue
 
@@ -360,6 +403,7 @@ class OBBFastBot(ClientXMPP):
 
                     resp = await reader.read(4)
                     if not resp or resp[1] != 0x00:
+                        logging.warning(f"SOCKS5: Connection request failed for {h_host}: {resp}")
                         writer.close()
                         continue
 
@@ -370,9 +414,10 @@ class OBBFastBot(ClientXMPP):
                     elif atyp == 0x04:  await reader.read(18)
 
                     # Отвечаем, что используем именно этот streamhost
+                    logging.info(f"SOCKS5: Connected to {h_host}, sending streamhost-used")
                     reply = iq.reply()
                     res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                    ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
+                    ET.SubElement(res_q, 'streamhost-used', jid=h_jid)
                     reply.append(res_q)
                     reply.send()
 
@@ -383,22 +428,28 @@ class OBBFastBot(ClientXMPP):
                     await writer.wait_closed()
                     return
 
-                except:
+                except Exception as e:
+                    logging.warning(f"SOCKS5: Error with host {h_host}: {e}")
                     continue
 
             # Если ни один прокси не сработал — ошибка
+            logging.error(f"SOCKS5: All streamhosts failed for sid={sid}")
             reply = iq.reply()
             reply['type'] = 'error'
             reply.send()
 
-        except:
-            pass
+        except Exception as e:
+            logging.error(f"SOCKS5 ERROR: {e}")
+        finally:
+            if sid in self.pending_files:
+                del self.pending_files[sid]
 
     # Асинхронная функция непосредственного приёма данных файла
     async def download_file_task(self, reader, file_info, peer_jid):
         user_dir, user_hash = self.get_user_info(peer_jid)
         path = os.path.join(user_dir, file_info['name'])
         received = 0
+        logging.info(f"DOWNLOAD START: {file_info['name']} to {path}")
 
         try:
             with open(path, 'wb') as f:
@@ -415,6 +466,7 @@ class OBBFastBot(ClientXMPP):
 
             # Если всё получили полностью — сообщаем пользователю ссылку
             if received == file_info['size']:
+                logging.info(f"DOWNLOAD COMPLETE: {file_info['name']}, {received} bytes")
                 safe_name = self.safe_quote(file_info['name'])
                 self.send_message(
                     mto=peer_jid,
@@ -423,6 +475,7 @@ class OBBFastBot(ClientXMPP):
                 )
             else:
                 # Если файл не докачан — удаляем его, чтобы не занимал квоту
+                logging.warning(f"DOWNLOAD INCOMPLETE: {file_info['name']}, got {received}/{file_info['size']}. Deleting.")
                 if os.path.exists(path):
                     os.remove(path)
 
