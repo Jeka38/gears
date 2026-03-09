@@ -73,6 +73,9 @@ class OBBFastBot(ClientXMPP):
         self.register_plugin('xep_0030')
         # Регистрируем плагин XEP-0199 (XMPP Ping)
         self.register_plugin('xep_0199')
+        # Включаем автоматический пинг сервера (Keepalive) каждые 60 секунд
+        self['xep_0199'].send_keepalive = True
+        self['xep_0199'].interval = 60
         # Регистрируем плагин XEP-0092 (Software Version)
         self.register_plugin('xep_0092')
         self['xep_0092'].software_name = os.getenv('APP_NAME', 'OBBFastBot')
@@ -231,15 +234,24 @@ class OBBFastBot(ClientXMPP):
             size /= 1024
         return f"{size:.1f}GB"
 
-    def get_help_text(self):
-        return (
+    def get_help_text(self, is_admin=False):
+        text = (
             "команды:\n"
             "ls - список ссылок на файлы в папке пользователя.\n"
             "ls <-s> - простой список файлов. Пример: ls -s\n"
             "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
             "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
+            "ping - проверить доступность бота.\n"
             "help или ? - список команд."
         )
+        if is_admin:
+            text += (
+                "\n\n🔧 Админ-команды:\n"
+                "add <jid|domain|*> - разрешить доступ (используйте * чтобы разрешить всем).\n"
+                "del <jid|domain|*> - запретить доступ.\n"
+                "list - показать белый список."
+            )
+        return text
 
     # Обработчик запроса на подписку
     def handle_presence_subscribe(self, presence):
@@ -256,7 +268,8 @@ class OBBFastBot(ClientXMPP):
         self.send_presence(pto=jid, ptype='subscribe')
 
         # Приветственное сообщение
-        welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text()}"
+        is_admin = ADMIN_JID and jid == ADMIN_JID
+        welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text(is_admin)}"
         self.send_message(mto=jid, mbody=welcome_msg, mtype='chat')
 
     # Обработчик подтверждения подписки
@@ -309,9 +322,15 @@ class OBBFastBot(ClientXMPP):
         # Команда помощи
         if cmd in ('help', '?'):
             if len(parts) != 1: return
+            is_admin = ADMIN_JID and msg['from'].bare == ADMIN_JID
             used = self.get_dir_size(user_dir)
-            help_text = self.get_help_text() + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
+            help_text = self.get_help_text(is_admin) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
             reply(help_text)
+
+        # Команда пинга
+        elif cmd == 'ping':
+            if len(parts) != 1: return
+            reply("pong")
 
         # Команда показа списка файлов
         elif cmd == 'ls':
@@ -394,7 +413,10 @@ class OBBFastBot(ClientXMPP):
                 entry = parts[1].lower()
                 self.whitelist.add(entry)
                 self.save_whitelist()
-                reply(f"➕ Добавлено: {entry}")
+                if entry == '*':
+                    reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
+                else:
+                    reply(f"➕ Добавлено: {entry}")
             elif cmd == 'del' and len(parts) == 2:
                 entry = parts[1].lower()
                 if entry in self.whitelist:
