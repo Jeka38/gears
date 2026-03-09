@@ -519,9 +519,11 @@ class OBBFastBot(ClientXMPP):
             field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
             options = [v.text for v in field.findall('{jabber:x:data}value')]
 
-            method = 'http://jabber.org/protocol/bytestreams' # По умолчанию S5B
-            if 'http://jabber.org/protocol/bytestreams' not in options and 'http://jabber.org/protocol/ibb' in options:
+            # Так как S5B часто не срабатывает, пробуем отдавать приоритет IBB если он предложен
+            if 'http://jabber.org/protocol/ibb' in options:
                 method = 'http://jabber.org/protocol/ibb'
+            else:
+                method = 'http://jabber.org/protocol/bytestreams'
 
             # Формируем ответ
             reply = iq.reply()
