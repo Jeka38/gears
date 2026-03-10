@@ -58,14 +58,25 @@ VERSION = os.getenv('APP_VERSION', '1.1')
 
 class Database:
     def __init__(self, db_path):
-        self.db_path = db_path
+        # Преобразуем в абсолютный путь для надёжности
+        self.db_path = os.path.abspath(db_path)
+        logging.info(f"Инициализация базы данных: {self.db_path}")
+
+        # Проверка, не является ли путь директорией (ошибка Docker volume)
+        if os.path.isdir(self.db_path):
+            logging.error(f"ОШИБКА: Путь к БД {self.db_path} является директорией! Проверьте docker-compose volumes.")
+            raise IsADirectoryError(f"{self.db_path} is a directory")
+
         # Убеждаемся, что папка для базы данных существует
         db_dir = os.path.dirname(self.db_path)
         if db_dir and not os.path.exists(db_dir):
+            logging.info(f"Создание директории для БД: {db_dir}")
             os.makedirs(db_dir, exist_ok=True)
+
         self._create_tables()
 
     def _create_tables(self):
+        logging.info(f"Подключение к SQLite: {self.db_path}")
         conn = sqlite3.connect(self.db_path)
         try:
             with conn:
