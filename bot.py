@@ -92,6 +92,7 @@ class OBBFastBot(ClientXMPP):
         # Регистрируем плагины для передачи файлов
         self.register_plugin('xep_0047') # IBB
         self.register_plugin('xep_0066') # OOB
+        self.register_plugin('xep_0234') # Jingle File Transfer
 
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
@@ -132,6 +133,136 @@ class OBBFastBot(ClientXMPP):
         self.register_handler(handler.Callback('HTTPUpload',
             matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:http:upload:0}request'),
             self.handle_http_upload))
+
+        # Явный обработчик для OOB (XEP-0066)
+        self.register_handler(handler.Callback('OOB',
+            matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'),
+            self.handle_oob))
+
+        # Явный обработчик для Jingle (XEP-0166)
+        self.register_handler(handler.Callback('Jingle',
+            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:jingle:1}jingle'),
+            self.handle_jingle))
+
+    # Обработчик Jingle (XEP-0166)
+    def handle_jingle(self, iq):
+        logging.info(f"JINGLE XML RECV: {iq}")
+        jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
+        action = jingle.get('action')
+
+        if action == 'session-initiate':
+            asyncio.create_task(self.handle_jingle_initiate(iq, jingle))
+        elif action == 'transport-info':
+            # Обработка кандидатов SOCKS5 от отправителя (если нужно)
+            pass
+        elif action == 'session-terminate':
+            sid = jingle.get('sid')
+            if sid in self.pending_files:
+                logging.info(f"Jingle session terminated: sid={sid}")
+                del self.pending_files[sid]
+
+    async def handle_jingle_initiate(self, iq, jingle):
+        sid = jingle.get('sid')
+        peer_jid = iq['from']
+
+        # Проверка белого списка
+        if not self.is_allowed(peer_jid):
+            logging.info(f"ACCESS DENIED (Jingle) from {peer_jid}")
+            if ADMIN_JID:
+                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка Jingle передачи от {peer_jid}", mtype='chat')
+            reply = iq.reply()
+            reply['type'] = 'error'
+            reply['error']['condition'] = 'forbidden'
+            return reply.send()
+
+        try:
+            content = jingle.find('{urn:xmpp:jingle:1}content')
+            description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
+            file_tag = description.find('{urn:xmpp:jingle:apps:file-transfer:5}file')
+
+            fname = os.path.basename(file_tag.findtext('{urn:xmpp:jingle:apps:file-transfer:5}name')).replace(' ', '_')
+            fsize = int(file_tag.findtext('{urn:xmpp:jingle:apps:file-transfer:5}size') or 0)
+
+            user_dir, _ = self.get_user_info(peer_jid)
+            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                logging.info(f"QUOTA EXCEEDED for {peer_jid}")
+                self.send_message(mto=peer_jid, mbody="⚠ Квота превышена!", mtype='chat')
+                reply = iq.reply()
+                reply['type'] = 'error'
+                reply['error']['condition'] = 'not-acceptable'
+                return reply.send()
+
+            self.pending_files[sid] = {
+                'name': fname,
+                'size': fsize,
+                'from': peer_jid.bare,
+                'timestamp': asyncio.get_event_loop().time(),
+                'jingle': True
+            }
+
+            # Предпочитаем IBB для передачи без прокси
+            transport_ibb = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+            transport_s5b = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+
+            if transport_ibb is not None:
+                await self.accept_jingle_ibb(iq, sid, transport_ibb)
+            elif transport_s5b is not None:
+                await self.accept_jingle_s5b(iq, sid, transport_s5b)
+            else:
+                reply = iq.reply()
+                reply['type'] = 'error'
+                reply['error']['condition'] = 'feature-not-implemented'
+                reply.send()
+
+        except Exception as e:
+            logging.error(f"JINGLE INITIATE ERROR: {e}")
+            reply = iq.reply()
+            reply['type'] = 'error'
+            reply.send()
+
+    async def accept_jingle_ibb(self, iq, sid, transport):
+        block_size = transport.get('block-size', '4096')
+        ibb_sid = transport.get('sid', sid)
+
+        # Переносим инфу о файле на IBB SID если он отличается
+        if ibb_sid != sid:
+            self.pending_files[ibb_sid] = self.pending_files[sid]
+
+        reply = iq.reply()
+        jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
+        content = ET.SubElement(jingle, 'content', creator='initiator', name='file-transfer')
+        ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
+        ET.SubElement(content, '{urn:xmpp:jingle:transports:ibb:1}transport', sid=ibb_sid, block_size=block_size)
+        reply.append(jingle)
+        reply.send()
+        logging.info(f"Jingle session accepted (IBB): sid={sid}, ibb_sid={ibb_sid}")
+
+    async def accept_jingle_s5b(self, iq, sid, transport):
+        dst_sid = transport.get('sid', sid)
+
+        # Переносим инфу
+        if dst_sid != sid:
+             self.pending_files[dst_sid] = self.pending_files[sid]
+
+        hosts = []
+        for candidate in transport.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
+            hosts.append({
+                'host': candidate.get('host'),
+                'port': int(candidate.get('port', 1080)),
+                'jid': candidate.get('jid')
+            })
+
+        reply = iq.reply()
+        jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
+        content = ET.SubElement(jingle, 'content', creator='initiator', name='file-transfer')
+        ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
+        ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=dst_sid)
+        reply.append(jingle)
+        reply.send()
+        logging.info(f"Jingle session accepted (S5B): sid={sid}, dst_sid={dst_sid}")
+
+        # Запускаем коннект в фоне
+        asyncio.create_task(self._socks5_connect_and_save(dst_sid, iq['from'], hosts, jingle_sid=sid))
 
     # Асинхронный цикл очистки зависших передач
     async def cleanup_pending_files(self):
@@ -175,6 +306,11 @@ class OBBFastBot(ClientXMPP):
         self['xep_0030'].add_feature('jabber:iq:oob')
         self['xep_0030'].add_feature('jabber:x:oob')
 
+        # Поддержка Jingle (XEP-0166) и Jingle File Transfer (XEP-0234)
+        self['xep_0030'].add_feature('urn:xmpp:jingle:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
 
         # Отправляем присутствие (online)
         self.send_presence()
@@ -782,8 +918,8 @@ class OBBFastBot(ClientXMPP):
         except Exception as e:
             logging.error(f"SOCKS5 SI ERROR: {e}")
 
-    # Общая логика SOCKS5 (для SI)
-    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None):
+    # Общая логика SOCKS5 (для SI и Jingle)
+    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None, jingle_sid=None):
         try:
             file_info = self.pending_files.get(sid)
             if not file_info:
@@ -838,6 +974,16 @@ class OBBFastBot(ClientXMPP):
                         reply.append(res_q)
                         reply.send()
 
+                    # Для Jingle нужно отправить transport-info с candidate-used
+                    if jingle_sid:
+                        iq = self.make_iq_set()
+                        iq['to'] = peer_jid
+                        jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='transport-info', sid=jingle_sid)
+                        content = ET.SubElement(jingle, 'content', creator='initiator', name='file-transfer')
+                        transport = ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=sid)
+                        ET.SubElement(transport, 'candidate-used', jid=h_jid)
+                        iq.append(jingle)
+                        iq.send()
 
                     await self.save_file_task(reader, file_info, peer_jid, sid_to_clean=sid)
                     writer.close()
