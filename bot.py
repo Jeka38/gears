@@ -480,6 +480,7 @@ class OBBFastBot(ClientXMPP):
             "ls <-s> - простой список файлов. Пример: ls -s\n"
             "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
             "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
+            "disco [jid] - disco#info для указанного JID (по умолчанию сервер бота).\n"
             "ping - проверить доступность бота.\n"
             "help или ? - список команд.\n\n"
             "Бот принимает файлы ТОЛЬКО через Jingle (SOCKS5 Bytestreams)."
@@ -525,6 +526,33 @@ class OBBFastBot(ClientXMPP):
         logging.info(f"➖ Запрос отписки от {jid}")
         if ADMIN_JID:
             self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов", mtype='chat')
+
+    async def disco_task(self, mto, target):
+        logging.info(f"DISCO request for {target}")
+        try:
+            info = await self['xep_0030'].get_info(jid=target, timeout=10)
+
+            res = [f"🔍 Disco info for {target}:"]
+
+            identities = info['disco_info']['identities']
+            if identities:
+                res.append("\nIdentities:")
+                for identity in identities:
+                    # identity is (category, type, lang, name)
+                    name = identity[3] or "(no name)"
+                    res.append(f"  - {identity[0]}/{identity[1]}: {name}")
+
+            features = sorted(info['disco_info']['features'])
+            if features:
+                res.append("\nFeatures:")
+                for feature in features:
+                    res.append(f"  - {feature}")
+
+            self.send_message(mto=mto, mbody="\n".join(res), mtype='chat')
+
+        except Exception as e:
+            logging.error(f"DISCO ERROR for {target}: {e}")
+            self.send_message(mto=mto, mbody=f"❌ Ошибка disco#info для {target}: {e}", mtype='chat')
 
     # Обработчик подтверждения отмены подписки
     def handle_presence_unsubscribed(self, presence):
@@ -614,6 +642,11 @@ class OBBFastBot(ClientXMPP):
                         f = files[idx]
                         url = f"{self.base_url}/{user_hash}/{self.safe_quote(f)}"
                         self.send_message(mto=msg['from'], mbody=f"{idx+1} - {url}", mtype='chat', oob_url=url)
+
+        # Команда дисковери
+        elif cmd in ('disco', '/disco'):
+            target = parts[1] if len(parts) > 1 else self.boundjid.domain
+            asyncio.create_task(self.disco_task(msg['from'], target))
 
         # Команда удаления файлов
         elif cmd == 'rm':
