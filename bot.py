@@ -50,7 +50,7 @@ ADMIN_JID = os.getenv('ADMIN_JID')
 WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
 # Путь к базе данных
-DB_PATH = os.getenv('DB_PATH', 'bot_data.db')
+DB_PATH = os.getenv('DB_PATH', '/app/data/bot_data.db')
 
 # Версия софта
 VERSION = os.getenv('APP_VERSION', '1.1')
@@ -59,6 +59,10 @@ VERSION = os.getenv('APP_VERSION', '1.1')
 class Database:
     def __init__(self, db_path):
         self.db_path = db_path
+        # Убеждаемся, что папка для базы данных существует
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
         self._create_tables()
 
     def _create_tables(self):
