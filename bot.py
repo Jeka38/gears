@@ -19,8 +19,6 @@ import json
 # Импорт модуля для корректной работы с URL (в частности quote для имён файлов)
 import urllib.parse
 
-# Импорт модуля aiohttp для реализации HTTP Upload
-from aiohttp import web
 
 # Импорт функции для загрузки переменных окружения из .env файла
 from dotenv import load_dotenv
@@ -110,31 +108,11 @@ class OBBFastBot(ClientXMPP):
         self.add_event_handler("xml_in", self.log_xml_in)
         self.add_event_handler("xml_out", self.log_xml_out)
 
-        # Регистрируем обработчик входящих SI (Stream Initiation) запросов
-        self.register_handler(handler.Callback('SI',
-            matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'),
-            self.handle_raw_si))
-
-        # Регистрируем обработчик входящих S5B (SOCKS5 Bytestreams) запросов
-        self.register_handler(handler.Callback('S5B',
-            matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/bytestreams}query'),
-            self.handle_raw_s5b))
-
         # Явный обработчик для XEP-0199 Ping (некоторые клиенты ждут элемент в ответе)
         self.register_handler(handler.Callback('Ping',
             matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'),
             self.handle_ping))
 
-
-        # Явный обработчик для HTTP Upload (XEP-0363)
-        self.register_handler(handler.Callback('HTTPUpload',
-            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:http:upload:0}request'),
-            self.handle_http_upload))
-
-        # Явный обработчик для OOB (XEP-0066)
-        self.register_handler(handler.Callback('OOB',
-            matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'),
-            self.handle_oob))
 
         # Явный обработчик для Jingle (XEP-0166)
         self.register_handler(handler.Callback('Jingle',
@@ -301,20 +279,7 @@ class OBBFastBot(ClientXMPP):
         # Выполняем асинхронно, чтобы не блокировать старт сессии
         asyncio.create_task(asyncio.to_thread(self.migrate_filenames))
 
-        # Сообщаем серверу, что мы поддерживаем SI (Stream Initiation)
-        self['xep_0030'].add_feature('http://jabber.org/protocol/si')
-
-        # Сообщаем, что поддерживаем SOCKS5 Bytestreams
-        self['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
-
-        # Указываем, что поддерживаем профиль передачи файлов через SI
-        self['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
-
-        # Поддержка HTTP Upload (XEP-0363)
-        self['xep_0030'].add_feature('urn:xmpp:http:upload:0')
-
-        # Поддержка OOB (XEP-0066)
-        self['xep_0030'].add_feature('jabber:iq:oob')
+        # Поддержка OOB (XEP-0066) - только отправка (x:oob)
         self['xep_0030'].add_feature('jabber:x:oob')
 
         # Поддержка Jingle (XEP-0166) и Jingle File Transfer (XEP-0234)
@@ -459,7 +424,8 @@ class OBBFastBot(ClientXMPP):
             "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
             "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
             "ping - проверить доступность бота.\n"
-            "help или ? - список команд."
+            "help или ? - список команд.\n\n"
+            "Бот принимает файлы ТОЛЬКО через Jingle (SOCKS5 Bytestreams)."
         )
         if is_admin:
             text += (
@@ -642,230 +608,10 @@ class OBBFastBot(ClientXMPP):
                 res = "\n".join(sorted(self.whitelist))
                 reply(f"📄 Белый список:\n{res or '(пусто)'}")
 
-    # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
-    def handle_raw_si(self, iq):
-        logging.info(f"SI XML RECV: {iq}")
-        # Проверка белого списка
-        if not self.is_allowed(iq['from']):
-            logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
-            if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}", mtype='chat')
-            reply = iq.reply()
-            reply['type'] = 'error'
-            return reply.send()
-
-        try:
-            # Находим элемент <si>
-            si = iq.xml.find('{http://jabber.org/protocol/si}si')
-
-            # ID сессии передачи и элемент <file>
-            sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
-
-            # Имя и размер файла, который хочет отправить собеседник
-            # Санитизируем имя файла для предотвращения Path Traversal
-            # Заменяем пробелы на подчёркивания
-            fname = os.path.basename(tag.get('name')).replace(' ', '_')
-            fsize = int(tag.get('size', 0))
-            logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
-
-            user_dir, _ = self.get_user_info(iq['from'])
-
-            # Проверяем, хватит ли места в квоте
-            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                logging.info(f"QUOTA EXCEEDED for {iq['from']}")
-                self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
-                reply = iq.reply()
-                reply['type'] = 'error'
-                return reply.send()
-
-            # Запоминаем информацию о файле, который сейчас будут передавать
-            self.pending_files[sid] = {
-                'name': fname,
-                'size': fsize,
-                'from': iq['from'].bare,
-                'timestamp': asyncio.get_event_loop().time()
-            }
-
-            # Определяем подходящий метод передачи из предложенных (с защитой от отсутствующих полей)
-            options = []
-            feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
-            if feature_neg is not None:
-                x_data = feature_neg.find('{jabber:x:data}x')
-                if x_data is not None:
-                    field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
-                    if field is not None:
-                        options = [v.text for v in field.findall('{jabber:x:data}value')]
-
-            # Так как S5B часто не срабатывает, пробуем отдавать приоритет OOB если он предложен
-            if 'jabber:iq:oob' in options:
-                method = 'jabber:iq:oob'
-            elif 'http://jabber.org/protocol/bytestreams' in options:
-                method = 'http://jabber.org/protocol/bytestreams'
-            else:
-                # Если ничего не нашли - пробуем S5B как наиболее вероятный дефолт
-                method = 'http://jabber.org/protocol/bytestreams'
-
-            # Формируем ответ
-            reply = iq.reply()
-            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
-            feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
-            x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
-            field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
-            ET.SubElement(field, '{jabber:x:data}value').text = method
-
-            # Обработка OOB в SI
-            if method == 'jabber:iq:oob':
-                # Для OOB в SI мы просто ожидаем, что клиент пришлет IQ jabber:iq:oob позже,
-                # либо сразу отвечаем подтверждением метода.
-                pass
-
-            reply.append(res_si)
-            logging.info(f"SI XML SEND (choice): {reply}")
-            reply.send()
-
-        except Exception as e:
-            logging.error(f"SI ERROR: {e}")
-            # Если что-то сломалось — молча игнорируем (не отвечаем)
-            pass
-
-    # Обработчик входящего запроса SOCKS5 Bytestreams
-    def handle_raw_s5b(self, iq):
-        logging.info(f"S5B REQUEST from {iq['from']}")
-        # Запускаем асинхронную задачу обработки SOCKS5
-        asyncio.create_task(self._manual_socks5_connect(iq))
 
 
 
-    # Обработчик запроса на HTTP Upload (XEP-0363)
-    def handle_http_upload(self, iq):
-        try:
-            req = iq.xml.find('{urn:xmpp:http:upload:0}request')
-            fname = req.get('filename')
-            fsize = int(req.get('size', 0))
 
-            # Санитизируем
-            fname = os.path.basename(fname).replace(' ', '_')
-
-            # Проверка белого списка
-            if not self.is_allowed(iq['from']):
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
-
-            # Проверка квоты
-            user_dir, user_hash = self.get_user_info(iq['from'])
-            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
-
-            # Генерируем уникальный токен для PUT
-            token = hashlib.sha256(f"{iq['from'].full}{fname}{fsize}{asyncio.get_event_loop().time()}".encode()).hexdigest()[:16]
-
-            # Запоминаем для сопоставления при PUT запросе
-            self.pending_files[token] = {
-                'name': fname,
-                'size': fsize,
-                'from': iq['from'].bare,
-                'timestamp': asyncio.get_event_loop().time()
-            }
-
-            # Формируем ответ со ссылками
-            reply = iq.reply()
-            slot = ET.Element('{urn:xmpp:http:upload:0}slot')
-
-            put_url = f"{self.base_url}/upload/{token}/{fname}"
-            get_url = f"{self.base_url}/{user_hash}/{self.safe_quote(fname)}"
-
-            put = ET.SubElement(slot, 'put')
-            put.set('url', put_url)
-
-            get = ET.SubElement(slot, 'get')
-            get.set('url', get_url)
-
-            reply.append(slot)
-            reply.send()
-            logging.info(f"HTTP UPLOAD slot generated for {fname} ({fsize} bytes)")
-
-        except Exception as e:
-            logging.error(f"HTTP UPLOAD ERROR: {e}")
-
-    # Обработчик запроса на OOB (XEP-0066)
-    def handle_oob(self, iq):
-        # Проверка белого списка
-        if not self.is_allowed(iq['from']):
-            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
-
-        try:
-            query = iq.xml.find('{jabber:iq:oob}query')
-            url = query.find('{jabber:iq:oob}url').text
-            fname = query.find('{jabber:iq:oob}desc')
-            if fname is not None:
-                fname = fname.text
-            else:
-                fname = os.path.basename(urllib.parse.urlparse(url).path)
-
-            # Санитизируем
-            fname = os.path.basename(fname).replace(' ', '_')
-            if not fname: fname = "downloaded_file"
-
-            logging.info(f"OOB REQUEST: {url} as {fname} from {iq['from']}")
-
-            # Запускаем задачу загрузки
-            asyncio.create_task(self.download_oob_task(url, fname, iq['from']))
-
-            # Отвечаем успехом (подтверждаем получение IQ)
-            iq.reply().send()
-
-        except Exception as e:
-            logging.error(f"OOB ERROR: {e}")
-            reply = iq.reply(); reply['type'] = 'error'; reply.send()
-
-    # Асинхронная задача загрузки файла по URL
-    async def download_oob_task(self, url, fname, peer_jid):
-        user_dir, user_hash = self.get_user_info(peer_jid)
-        path = os.path.join(user_dir, fname)
-
-        logging.info(f"OOB DOWNLOAD START: {url} to {path}")
-
-        try:
-            import aiohttp
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=300) as resp:
-                    if resp.status != 200:
-                        logging.error(f"OOB DOWNLOAD FAILED: status {resp.status}")
-                        return
-
-                    # Проверка квоты (размер может быть неизвестен заранее, проверяем по ходу)
-                    content_length = resp.headers.get('Content-Length')
-                    fsize = int(content_length) if content_length else 0
-
-                    if fsize and self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                        self.send_message(mto=peer_jid, mbody="⚠ Квота превышена!", mtype='chat')
-                        return
-
-                    received = 0
-                    with open(path, 'wb') as f:
-                        async for chunk in resp.content.iter_chunked(1048576):
-                            if self.get_dir_size(user_dir) + received + len(chunk) > QUOTA_LIMIT_BYTES:
-                                self.send_message(mto=peer_jid, mbody="⚠ Квота превышена в процессе загрузки!", mtype='chat')
-                                f.close()
-                                os.remove(path)
-                                return
-
-                            await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
-                            received += len(chunk)
-
-                        f.flush()
-                        await asyncio.get_event_loop().run_in_executor(None, os.fsync, f.fileno())
-
-            logging.info(f"OOB DOWNLOAD COMPLETE: {fname}, {received} bytes")
-            safe_name = self.safe_quote(fname)
-            self.send_message(
-                mto=peer_jid,
-                mbody=f"✅ Готово (OOB)!\n{self.base_url}/{user_hash}/{safe_name}",
-                mtype='chat'
-            )
-
-        except Exception as e:
-            logging.error(f"OOB DOWNLOAD ERROR: {e}")
-            if os.path.exists(path): os.remove(path)
 
 
     # Обработчик XMPP Ping
@@ -878,46 +624,9 @@ class OBBFastBot(ClientXMPP):
         reply.send()
         logging.info(f"PONG SENT to {iq['from']}")
 
-    # Асинхронная функция подключения по SOCKS5 и приёма файла
-    async def _manual_socks5_connect(self, iq):
-        try:
-            query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
-            if query is None:
-                logging.error(f"SOCKS5: Query element not found in IQ: {iq}")
-                return
-            sid = query.get('sid')
 
-            # Собираем список хостов из SI запроса
-            hosts = []
-            for host in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
-                hosts.append({
-                    'host': host.get('host'),
-                    'port': int(host.get('port', 1080)),
-                    'jid': host.get('jid')
-                })
-
-            # Запускаем общую логику подключения
-            success = await self._socks5_connect_and_save(sid, iq['from'], hosts, iq_for_si_reply=iq)
-
-            if not success:
-                # Если ни один прокси не сработал — ошибка SI
-                if not hosts:
-                    self.send_message(
-                        mto=iq['from'].bare,
-                        mbody="⚠ Не найдено доступных путей для передачи (SOCKS5).",
-                        mtype='chat'
-                    )
-                reply = iq.reply()
-                reply['type'] = 'error'
-                reply['error']['condition'] = 'item-not-found'
-                reply['error']['text'] = 'SOCKS5 failed'
-                reply.send()
-
-        except Exception as e:
-            logging.error(f"SOCKS5 SI ERROR: {e}")
-
-    # Общая логика SOCKS5 (для SI и Jingle)
-    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None, jingle_sid=None):
+    # Общая логика SOCKS5 (для Jingle)
+    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, jingle_sid=None):
         try:
             file_info = self.pending_files.get(sid)
             if not file_info:
@@ -964,14 +673,6 @@ class OBBFastBot(ClientXMPP):
 
                     logging.info(f"SOCKS5: Connected to {h_host}")
 
-                    # Для SI нужно отправить подтверждение streamhost-used
-                    if iq_for_si_reply:
-                        reply = iq_for_si_reply.reply()
-                        res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                        ET.SubElement(res_q, 'streamhost-used', jid=h_jid)
-                        reply.append(res_q)
-                        reply.send()
-
                     # Для Jingle нужно отправить transport-info с candidate-used
                     if jingle_sid:
                         info = self.pending_files.get(sid)
@@ -1003,7 +704,7 @@ class OBBFastBot(ClientXMPP):
     # Асинхронная функция непосредственного приёма данных файла
     async def save_file_task(self, stream, file_info, peer_jid, sid_to_clean=None):
         user_dir, user_hash = self.get_user_info(peer_jid)
-        # Имя файла уже санитизировано в handle_raw_si
+        # Имя файла уже санитизировано в handle_jingle_initiate
         fname = file_info['name']
         path = os.path.join(user_dir, fname)
         received = 0
@@ -1058,45 +759,6 @@ class OBBFastBot(ClientXMPP):
                 del self.pending_files[sid_to_clean]
 
 
-# Обработчик PUT-запросов для HTTP Upload
-async def handle_upload_put(request):
-    token = request.match_info.get('token')
-    bot = request.app['bot']
-
-    info = bot.pending_files.get(token)
-    if not info:
-        return web.Response(status=404, text="Unknown token")
-
-    user_dir, user_hash = bot.get_user_info(slixmpp.JID(info['from']))
-    path = os.path.join(user_dir, info['name'])
-
-    logging.info(f"HTTP PUT upload started: {info['name']} for {info['from']}")
-
-    try:
-        # Поскольку request.content.read() асинхронный, мы не можем просто обернуть весь цикл в executor.
-        # Будем выполнять в executor только блокирующую операцию записи.
-        with open(path, 'wb') as f:
-            while True:
-                chunk = await request.content.read(1048576)
-                if not chunk:
-                    break
-                await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
-
-        # Уведомляем пользователя
-        url = f"{bot.base_url}/{user_hash}/{bot.safe_quote(info['name'])}"
-        bot.send_message(
-            mto=info['from'],
-            mbody=f"✅ Готово (HTTP)!\n{url}",
-            mtype='chat',
-            oob_url=url
-        )
-        del bot.pending_files[token]
-        return web.Response(status=201)
-
-    except Exception as e:
-        logging.error(f"HTTP PUT ERROR: {e}")
-        if os.path.exists(path): os.remove(path)
-        return web.Response(status=500)
 
 # Точка входа — основная асинхронная функция
 async def main():
@@ -1125,17 +787,6 @@ async def main():
     xmpp_port = int(os.getenv('XMPP_PORT', 5222))
     bot.connect((xmpp_host, xmpp_port))
 
-    # Настраиваем HTTP Upload сервер
-    app = web.Application()
-    app['bot'] = bot
-    app.router.add_put('/upload/{token}/{filename}', handle_upload_put)
-
-    upload_port = int(os.getenv('HTTP_UPLOAD_PORT', 8080))
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', upload_port)
-    await site.start()
-    logging.info(f"🌍 HTTP Upload server started on port {upload_port}")
 
     # Ждём отключения (работаем до разрыва соединения)
     await bot.disconnected
