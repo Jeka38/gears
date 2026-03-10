@@ -127,10 +127,6 @@ class OBBFastBot(ClientXMPP):
             matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'),
             self.handle_ping))
 
-        # Явный обработчик для Jingle
-        self.register_handler(handler.Callback('Jingle',
-            matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:jingle:1}jingle'),
-            self.handle_jingle))
 
         # Явный обработчик для HTTP Upload (XEP-0363)
         self.register_handler(handler.Callback('HTTPUpload',
@@ -179,11 +175,6 @@ class OBBFastBot(ClientXMPP):
         self['xep_0030'].add_feature('jabber:iq:oob')
         self['xep_0030'].add_feature('jabber:x:oob')
 
-        # Поддержка Jingle
-        self['xep_0030'].add_feature('urn:xmpp:jingle:1')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
 
         # Отправляем присутствие (online)
         self.send_presence()
@@ -507,6 +498,7 @@ class OBBFastBot(ClientXMPP):
 
     # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
     def handle_raw_si(self, iq):
+        logging.info(f"SI XML RECV: {iq}")
         # Проверка белого списка
         if not self.is_allowed(iq['from']):
             logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
@@ -584,6 +576,7 @@ class OBBFastBot(ClientXMPP):
                 pass
 
             reply.append(res_si)
+            logging.info(f"SI XML SEND (choice): {reply}")
             reply.send()
 
         except Exception as e:
@@ -607,113 +600,6 @@ class OBBFastBot(ClientXMPP):
         else:
             logging.warning(f"IBB STREAM: Unknown SID {sid}")
 
-    # Обработчик Jingle (XEP-0166)
-    def handle_jingle(self, iq):
-        logging.info(f"JINGLE XML RECV: {iq}")
-        jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
-        action = jingle.get('action')
-        sid = jingle.get('sid')
-        logging.info(f"JINGLE {action} from {iq['from']}, sid={sid}")
-
-        if action == 'session-initiate':
-            # Проверка белого списка
-            if not self.is_allowed(iq['from']):
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
-
-            # Парсим описание файла (XEP-0234)
-            content = jingle.find('{urn:xmpp:jingle:1}content')
-            description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
-            file_tag = description.find('{urn:xmpp:jingle:apps:file-transfer:5}file')
-
-            fname = file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}name').text
-            fsize = int(file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}size').text)
-            fname = os.path.basename(fname).replace(' ', '_')
-
-            # Проверка квоты
-            user_dir, _ = self.get_user_info(iq['from'])
-            if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                logging.info(f"QUOTA EXCEEDED (Jingle) for {iq['from']}")
-                self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
-
-            # Запоминаем инфо (ключ — Jingle Session ID)
-            file_info = {
-                'name': fname,
-                'size': fsize,
-                'from': iq['from'].bare,
-                'jingle_sid': sid,
-                'timestamp': asyncio.get_event_loop().time()
-            }
-            self.pending_files[sid] = file_info
-
-            # Соглашаемся (session-accept)
-            reply = iq.reply()
-            res_jingle = ET.Element('{urn:xmpp:jingle:1}jingle', {
-                'action': 'session-accept',
-                'sid': sid,
-                'initiator': iq['from'].full
-            })
-
-            res_content = ET.SubElement(res_jingle, '{urn:xmpp:jingle:1}content', {
-                'creator': content.get('creator'),
-                'name': content.get('name')
-            })
-            res_content.append(description)
-
-            # Проверяем транспорты
-            s5b_transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
-            ibb_transport = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
-
-            if s5b_transport is not None:
-                # SOCKS5 Jingle (XEP-0260)
-                s5b_sid = s5b_transport.get('sid')
-                # Связываем S5B SID с информацией о файле
-                self.pending_files[s5b_sid] = file_info
-
-                res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:s5b:1}transport', {
-                    'sid': s5b_sid
-                })
-                # Собираем кандидатов
-                candidates = []
-                for cand in s5b_transport.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
-                    candidates.append({
-                        'host': cand.get('host'),
-                        'port': int(cand.get('port', 1080)),
-                        'jid': cand.get('jid'),
-                        'cid': cand.get('cid')
-                    })
-                # Пытаемся подключиться
-                ctx = {
-                    'sid': sid,
-                    'creator': content.get('creator'),
-                    'name': content.get('name')
-                }
-                asyncio.create_task(self._socks5_connect_and_save(s5b_sid, iq['from'], candidates, jingle_ctx=ctx))
-
-            elif ibb_transport is not None:
-                # IBB Jingle (XEP-0261)
-                ibb_sid = ibb_transport.get('sid')
-                self.pending_files[ibb_sid] = file_info
-
-                res_transport = ET.SubElement(res_content, '{urn:xmpp:jingle:transports:ibb:1}transport', {
-                    'sid': ibb_sid,
-                    'block-size': ibb_transport.get('block-size', '4096')
-                })
-                # IBB запустится через ibb_stream_start event
-
-            reply.append(res_jingle)
-            logging.info(f"JINGLE XML SEND (session-accept): {reply}")
-            reply.send()
-
-        elif action == 'transport-info':
-            # Дополнительные кандидаты или подтверждение выбора (candidate-used)
-            # В простейшей реализации просто отвечаем ack
-            iq.reply().send()
-
-        elif action == 'session-terminate':
-            if sid in self.pending_files:
-                del self.pending_files[sid]
-            iq.reply().send()
 
     # Обработчик запроса на HTTP Upload (XEP-0363)
     def handle_http_upload(self, iq):
@@ -884,21 +770,20 @@ class OBBFastBot(ClientXMPP):
                     self.send_message(
                         mto=iq['from'].bare,
                         mbody="⚠ Не найдено доступных путей для передачи (SOCKS5). "
-                              "Бот пробует переключиться на Jingle/IBB...",
+                              "Бот пробует переключиться на IBB...",
                         mtype='chat'
                     )
                 reply = iq.reply()
                 reply['type'] = 'error'
-                # Предлагаем клиенту попробовать Jingle (XEP-0166)
                 reply['error']['condition'] = 'item-not-found'
-                reply['error']['text'] = 'SOCKS5 failed, trying Jingle fallback'
+                reply['error']['text'] = 'SOCKS5 failed'
                 reply.send()
 
         except Exception as e:
             logging.error(f"SOCKS5 SI ERROR: {e}")
 
-    # Общая логика SOCKS5 (для SI и Jingle)
-    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None, jingle_ctx=None):
+    # Общая логика SOCKS5 (для SI)
+    async def _socks5_connect_and_save(self, sid, peer_jid, hosts, iq_for_si_reply=None):
         try:
             file_info = self.pending_files.get(sid)
             if not file_info:
@@ -916,7 +801,6 @@ class OBBFastBot(ClientXMPP):
             logging.info(f"SOCKS5: Found {len(hosts)} streamhosts")
             for host in hosts:
                 h_host, h_port, h_jid = host['host'], host['port'], host['jid']
-                h_cid = host.get('cid') # Только для Jingle
                 logging.info(f"SOCKS5: Trying {h_host}:{h_port} ({h_jid})")
                 try:
                     reader, writer = await asyncio.wait_for(
@@ -954,25 +838,6 @@ class OBBFastBot(ClientXMPP):
                         reply.append(res_q)
                         reply.send()
 
-                    # Для Jingle отправляем transport-info (candidate-used)
-                    if jingle_ctx and h_cid:
-                        info_iq = self.Iq(mto=peer_jid.full, mtype='set')
-                        j = ET.Element('{urn:xmpp:jingle:1}jingle', {
-                            'action': 'transport-info',
-                            'sid': jingle_ctx['sid'],
-                            'initiator': peer_jid.full
-                        })
-                        c = ET.SubElement(j, '{urn:xmpp:jingle:1}content', {
-                            'creator': jingle_ctx['creator'],
-                            'name': jingle_ctx['name']
-                        })
-                        t = ET.SubElement(c, '{urn:xmpp:jingle:transports:s5b:1}transport', {
-                            'sid': sid
-                        })
-                        ET.SubElement(t, 'candidate-used', cid=h_cid)
-                        info_iq.append(j)
-                        info_iq.send()
-                        logging.info(f"JINGLE transport-info (candidate-used) SENT for cid={h_cid}")
 
                     await self.save_file_task(reader, file_info, peer_jid, sid_to_clean=sid)
                     writer.close()
