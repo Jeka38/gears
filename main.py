@@ -50,7 +50,7 @@ ADMIN_JID = os.getenv('ADMIN_JID')
 WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
 # Путь к базе данных
-DB_PATH = os.getenv('DB_PATH', '/app/data/bot_data.db')
+DB_PATH = os.getenv('DB_PATH', '/app/data/bot.db')
 
 # Версия софта
 VERSION = os.getenv('APP_VERSION', '1.1')
@@ -64,8 +64,9 @@ class Database:
 
         # Проверка, не является ли путь директорией (ошибка Docker volume)
         if os.path.isdir(self.db_path):
-            logging.error(f"ОШИБКА: Путь к БД {self.db_path} является директорией! Проверьте docker-compose volumes.")
-            raise IsADirectoryError(f"{self.db_path} is a directory")
+            # Если это директория, попробуем использовать файл внутри неё
+            logging.warning(f"ВНИМАНИЕ: Путь {self.db_path} — директория. Используем {self.db_path}/bot.db")
+            self.db_path = os.path.join(self.db_path, "bot.db")
 
         # Убеждаемся, что папка для базы данных существует
         db_dir = os.path.dirname(self.db_path)
