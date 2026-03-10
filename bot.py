@@ -76,9 +76,6 @@ class OBBFastBot(ClientXMPP):
         self.whitelist = set()
         self.load_whitelist()
 
-        # Миграция имен файлов (замена пробелов на подчёркивания)
-        self.migrate_filenames()
-
         # Регистрируем плагин XEP-0030 (Service Discovery)
         self.register_plugin('xep_0030')
         # Регистрируем плагин XEP-0199 (XMPP Ping)
@@ -94,6 +91,7 @@ class OBBFastBot(ClientXMPP):
 
         # Регистрируем плагины для передачи файлов
         self.register_plugin('xep_0047') # IBB
+        self.register_plugin('xep_0066') # OOB
 
         # Подписываемся на событие успешного входа в сеть
         self.add_event_handler("session_start", self.start)
@@ -158,6 +156,10 @@ class OBBFastBot(ClientXMPP):
         # Запускаем очистку зависших передач
         asyncio.create_task(self.cleanup_pending_files())
 
+        # Миграция имен файлов (замена пробелов на подчёркивания)
+        # Выполняем асинхронно, чтобы не блокировать старт сессии
+        asyncio.create_task(asyncio.to_thread(self.migrate_filenames))
+
         # Сообщаем серверу, что мы поддерживаем SI (Stream Initiation)
         self['xep_0030'].add_feature('http://jabber.org/protocol/si')
 
@@ -173,11 +175,14 @@ class OBBFastBot(ClientXMPP):
         # Поддержка HTTP Upload (XEP-0363)
         self['xep_0030'].add_feature('urn:xmpp:http:upload:0')
 
+        # Поддержка OOB (XEP-0066)
+        self['xep_0030'].add_feature('jabber:iq:oob')
+        self['xep_0030'].add_feature('jabber:x:oob')
+
         # Поддержка Jingle
         self['xep_0030'].add_feature('urn:xmpp:jingle:1')
         self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
         self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
-        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ice-udp:1')
         self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
 
         # Отправляем присутствие (online)
@@ -264,10 +269,18 @@ class OBBFastBot(ClientXMPP):
                        else urllib.parse.quote(c) for c in text)
 
     def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
-                     mfrom=None, mnick=None):
+                     mfrom=None, mnick=None, oob_url=None):
         if mbody and not mbody.startswith('\n'):
             mbody = '\n' + mbody
-        super().send_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
+
+        msg = self.make_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
+        if oob_url:
+            x_oob = ET.Element('{jabber:x:oob}x')
+            url_el = ET.SubElement(x_oob, 'url')
+            url_el.text = oob_url
+            msg.append(x_oob)
+
+        msg.send()
 
     # Получаем (и при необходимости создаём) персональную папку пользователя
     def get_user_info(self, jid):
@@ -415,11 +428,10 @@ class OBBFastBot(ClientXMPP):
                     reply("\n".join(res))
                 return
 
-            # По умолчанию (просто ls) - список ссылок
-            res = []
+            # По умолчанию (просто ls) - список ссылок через OOB
             for i, f in enumerate(files):
-                res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
-            reply("\n".join(res))
+                url = f"{self.base_url}/{user_hash}/{self.safe_quote(f)}"
+                self.send_message(mto=msg['from'], mbody=f"{i+1} - {url}", mtype='chat', oob_url=url)
 
         # Команда получения ссылки на файл
         elif cmd in ('link', 'lnk'):
@@ -429,22 +441,19 @@ class OBBFastBot(ClientXMPP):
                 return reply("📁 Папка пуста")
 
             if parts[1] == '*':
-                res = []
                 for i, f in enumerate(files):
-                    res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
-                reply("\n".join(res))
+                    url = f"{self.base_url}/{user_hash}/{self.safe_quote(f)}"
+                    self.send_message(mto=msg['from'], mbody=f"{i+1} - {url}", mtype='chat', oob_url=url)
             else:
                 try:
                     indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())))
                 except ValueError: return
 
-                res = []
                 for idx in indices:
                     if 0 <= idx < len(files):
                         f = files[idx]
-                        res.append(f"{idx+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
-                if res:
-                    reply("\n".join(res))
+                        url = f"{self.base_url}/{user_hash}/{self.safe_quote(f)}"
+                        self.send_message(mto=msg['from'], mbody=f"{idx+1} - {url}", mtype='chat', oob_url=url)
 
         # Команда удаления файлов
         elif cmd == 'rm':
@@ -549,8 +558,10 @@ class OBBFastBot(ClientXMPP):
                     if field is not None:
                         options = [v.text for v in field.findall('{jabber:x:data}value')]
 
-            # Так как S5B часто не срабатывает, пробуем отдавать приоритет IBB если он предложен
-            if 'http://jabber.org/protocol/ibb' in options:
+            # Так как S5B часто не срабатывает, пробуем отдавать приоритет OOB или IBB если они предложены
+            if 'jabber:iq:oob' in options:
+                method = 'jabber:iq:oob'
+            elif 'http://jabber.org/protocol/ibb' in options:
                 method = 'http://jabber.org/protocol/ibb'
             elif 'http://jabber.org/protocol/bytestreams' in options:
                 method = 'http://jabber.org/protocol/bytestreams'
@@ -565,6 +576,12 @@ class OBBFastBot(ClientXMPP):
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
             ET.SubElement(field, '{jabber:x:data}value').text = method
+
+            # Обработка OOB в SI
+            if method == 'jabber:iq:oob':
+                # Для OOB в SI мы просто ожидаем, что клиент пришлет IQ jabber:iq:oob позже,
+                # либо сразу отвечаем подтверждением метода.
+                pass
 
             reply.append(res_si)
             reply.send()
@@ -748,6 +765,87 @@ class OBBFastBot(ClientXMPP):
         except Exception as e:
             logging.error(f"HTTP UPLOAD ERROR: {e}")
 
+    # Обработчик запроса на OOB (XEP-0066)
+    def handle_oob(self, iq):
+        # Проверка белого списка
+        if not self.is_allowed(iq['from']):
+            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+
+        try:
+            query = iq.xml.find('{jabber:iq:oob}query')
+            url = query.find('{jabber:iq:oob}url').text
+            fname = query.find('{jabber:iq:oob}desc')
+            if fname is not None:
+                fname = fname.text
+            else:
+                fname = os.path.basename(urllib.parse.urlparse(url).path)
+
+            # Санитизируем
+            fname = os.path.basename(fname).replace(' ', '_')
+            if not fname: fname = "downloaded_file"
+
+            logging.info(f"OOB REQUEST: {url} as {fname} from {iq['from']}")
+
+            # Запускаем задачу загрузки
+            asyncio.create_task(self.download_oob_task(url, fname, iq['from']))
+
+            # Отвечаем успехом (подтверждаем получение IQ)
+            iq.reply().send()
+
+        except Exception as e:
+            logging.error(f"OOB ERROR: {e}")
+            reply = iq.reply(); reply['type'] = 'error'; reply.send()
+
+    # Асинхронная задача загрузки файла по URL
+    async def download_oob_task(self, url, fname, peer_jid):
+        user_dir, user_hash = self.get_user_info(peer_jid)
+        path = os.path.join(user_dir, fname)
+
+        logging.info(f"OOB DOWNLOAD START: {url} to {path}")
+
+        try:
+            import aiohttp
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=300) as resp:
+                    if resp.status != 200:
+                        logging.error(f"OOB DOWNLOAD FAILED: status {resp.status}")
+                        return
+
+                    # Проверка квоты (размер может быть неизвестен заранее, проверяем по ходу)
+                    content_length = resp.headers.get('Content-Length')
+                    fsize = int(content_length) if content_length else 0
+
+                    if fsize and self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                        self.send_message(mto=peer_jid, mbody="⚠ Квота превышена!", mtype='chat')
+                        return
+
+                    received = 0
+                    with open(path, 'wb') as f:
+                        async for chunk in resp.content.iter_chunked(1048576):
+                            if self.get_dir_size(user_dir) + received + len(chunk) > QUOTA_LIMIT_BYTES:
+                                self.send_message(mto=peer_jid, mbody="⚠ Квота превышена в процессе загрузки!", mtype='chat')
+                                f.close()
+                                os.remove(path)
+                                return
+
+                            await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
+                            received += len(chunk)
+
+                        f.flush()
+                        await asyncio.get_event_loop().run_in_executor(None, os.fsync, f.fileno())
+
+            logging.info(f"OOB DOWNLOAD COMPLETE: {fname}, {received} bytes")
+            safe_name = self.safe_quote(fname)
+            self.send_message(
+                mto=peer_jid,
+                mbody=f"✅ Готово (OOB)!\n{self.base_url}/{user_hash}/{safe_name}",
+                mtype='chat'
+            )
+
+        except Exception as e:
+            logging.error(f"OOB DOWNLOAD ERROR: {e}")
+            if os.path.exists(path): os.remove(path)
+
 
     # Обработчик XMPP Ping
     def handle_ping(self, iq):
@@ -815,7 +913,7 @@ class OBBFastBot(ClientXMPP):
             ).hexdigest()
             logging.info(f"SOCKS5: Calculated dst_addr={dst_addr} for sid={sid}")
 
-            logging.info(f"SOCKS5: Found {len(hosts)} streamhosts/candidates")
+            logging.info(f"SOCKS5: Found {len(hosts)} streamhosts")
             for host in hosts:
                 h_host, h_port, h_jid = host['host'], host['port'], host['jid']
                 h_cid = host.get('cid') # Только для Jingle
@@ -922,10 +1020,12 @@ class OBBFastBot(ClientXMPP):
             if received == file_info['size']:
                 logging.info(f"DOWNLOAD COMPLETE: {fname}, {received} bytes")
                 safe_name = self.safe_quote(fname)
+                url = f"{self.base_url}/{user_hash}/{safe_name}"
                 self.send_message(
                     mto=peer_jid,
-                    mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_name}",
-                    mtype='chat'
+                    mbody=f"✅ Готово!\n{url}",
+                    mtype='chat',
+                    oob_url=url
                 )
             else:
                 logging.warning(f"DOWNLOAD INCOMPLETE: {fname}, got {received}/{file_info['size']}. Deleting.")
@@ -956,12 +1056,6 @@ async def handle_upload_put(request):
     logging.info(f"HTTP PUT upload started: {info['name']} for {info['from']}")
 
     try:
-        def write_to_file():
-            with open(path, 'wb') as f:
-                # Читаем данные из запроса порциями
-                # request.content.read() - корутина, поэтому читаем снаружи и передаем
-                pass
-
         # Поскольку request.content.read() асинхронный, мы не можем просто обернуть весь цикл в executor.
         # Будем выполнять в executor только блокирующую операцию записи.
         with open(path, 'wb') as f:
@@ -972,10 +1066,12 @@ async def handle_upload_put(request):
                 await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
 
         # Уведомляем пользователя
+        url = f"{bot.base_url}/{user_hash}/{bot.safe_quote(info['name'])}"
         bot.send_message(
             mto=info['from'],
-            mbody=f"✅ Готово (HTTP)!\n{bot.base_url}/{user_hash}/{bot.safe_quote(info['name'])}",
-            mtype='chat'
+            mbody=f"✅ Готово (HTTP)!\n{url}",
+            mtype='chat',
+            oob_url=url
         )
         del bot.pending_files[token]
         return web.Response(status=201)
