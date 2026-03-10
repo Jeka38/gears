@@ -200,14 +200,14 @@ class OBBFastBot(ClientXMPP):
                 'jingle': True
             }
 
-            # Предпочитаем IBB для передачи без прокси
-            transport_ibb = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+            # Предпочитаем S5B
             transport_s5b = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+            transport_ibb = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
 
-            if transport_ibb is not None:
-                await self.accept_jingle_ibb(iq, sid, transport_ibb)
-            elif transport_s5b is not None:
+            if transport_s5b is not None:
                 await self.accept_jingle_s5b(iq, sid, transport_s5b)
+            elif transport_ibb is not None:
+                await self.accept_jingle_ibb(iq, sid, transport_ibb)
             else:
                 reply = iq.reply()
                 reply['type'] = 'error'
@@ -230,7 +230,7 @@ class OBBFastBot(ClientXMPP):
 
         reply = iq.reply()
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
-        content = ET.SubElement(jingle, 'content', creator='initiator', name='file-transfer')
+        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator='initiator', name='file-transfer')
         ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
         ET.SubElement(content, '{urn:xmpp:jingle:transports:ibb:1}transport', sid=ibb_sid, block_size=block_size)
         reply.append(jingle)
@@ -254,7 +254,7 @@ class OBBFastBot(ClientXMPP):
 
         reply = iq.reply()
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
-        content = ET.SubElement(jingle, 'content', creator='initiator', name='file-transfer')
+        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator='initiator', name='file-transfer')
         ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
         ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=dst_sid)
         reply.append(jingle)
@@ -979,9 +979,9 @@ class OBBFastBot(ClientXMPP):
                         iq = self.make_iq_set()
                         iq['to'] = peer_jid
                         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='transport-info', sid=jingle_sid)
-                        content = ET.SubElement(jingle, 'content', creator='initiator', name='file-transfer')
+                        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator='initiator', name='file-transfer')
                         transport = ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=sid)
-                        ET.SubElement(transport, 'candidate-used', jid=h_jid)
+                        ET.SubElement(transport, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', jid=h_jid)
                         iq.append(jingle)
                         iq.send()
 
