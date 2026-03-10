@@ -88,6 +88,7 @@ class OBBFastBot(ClientXMPP):
         self['xep_0092'].version = f"{VERSION} on Python {platform.python_version()} + slixmpp {slixmpp.__version__}"
 
         # Регистрируем плагины для передачи файлов
+        self.register_plugin('xep_0047') # IBB
         self.register_plugin('xep_0066') # OOB
         self.register_plugin('xep_0234') # Jingle File Transfer
 
@@ -96,6 +97,11 @@ class OBBFastBot(ClientXMPP):
 
         # Подписываемся на входящие сообщения (chat / normal)
         self.add_event_handler("message", self.handle_message)
+
+        # Обработчики для IBB
+        self.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        self.add_event_handler("ibb_stream_data", self.handle_ibb_data)
+        self.add_event_handler("ibb_stream_end", self.handle_ibb_end)
 
 
         # Обработка подписки на присутствие
@@ -198,13 +204,16 @@ class OBBFastBot(ClientXMPP):
                 'content_creator': c_creator
             }
 
-            # Используем только SOCKS5
+            # Предпочитаем SOCKS5, fallback на IBB
             transport_s5b = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+            transport_ibb = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
 
             if transport_s5b is not None:
                 await self.accept_jingle_s5b(iq, sid, transport_s5b)
+            elif transport_ibb is not None:
+                await self.accept_jingle_ibb(iq, sid, transport_ibb)
             else:
-                self.send_message(mto=peer_jid, mbody="⚠ Не найден подходящий транспорт для передачи файла (нужен SOCKS5).", mtype='chat')
+                self.send_message(mto=peer_jid, mbody="⚠ Не найден подходящий транспорт для передачи файла (нужен SOCKS5 или IBB).", mtype='chat')
                 reply = iq.reply()
                 reply['type'] = 'error'
                 reply['error']['condition'] = 'feature-not-implemented'
@@ -215,6 +224,27 @@ class OBBFastBot(ClientXMPP):
             reply = iq.reply()
             reply['type'] = 'error'
             reply.send()
+
+    async def accept_jingle_ibb(self, iq, sid, transport):
+        info = self.pending_files[sid]
+        block_size = transport.get('block-size', '8192')
+
+        # Монокль присылает свой IBB SID. Нам нужно на него отвечать и по нему искать файл.
+        ibb_sid = transport.get('sid', sid)
+        if ibb_sid != sid:
+            self.pending_files[ibb_sid] = info
+
+        reply = iq.reply()
+        jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
+        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator=info['content_creator'], name=info['content_name'])
+        ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
+        ET.SubElement(content, '{urn:xmpp:jingle:transports:ibb:1}transport', sid=ibb_sid, **{'block-size': block_size})
+        reply.append(jingle)
+        reply.send()
+        logging.info(f"Jingle session accepted (IBB): sid={sid}, ibb_sid={ibb_sid}")
+
+        # После session-accept отправить session-info
+        self.send_jingle_session_info(iq['from'], sid, info)
 
     def send_jingle_session_info(self, mto, sid, info):
         iq = self.make_iq_set()
@@ -256,6 +286,23 @@ class OBBFastBot(ClientXMPP):
         # Запускаем коннект в фоне
         asyncio.create_task(self._socks5_connect_and_save(dst_sid, iq['from'], hosts, jingle_sid=sid))
 
+    # Обработчик начала IBB стрима
+    def handle_ibb_stream(self, stream):
+        sid = stream.sid
+        logging.info(f"DEBUG IBB: STREAM START ATTEMPT sid={sid}")
+        file_info = self.pending_files.get(sid)
+        if file_info:
+            logging.info(f"DEBUG IBB: MATCH FOUND sid={sid}, file={file_info.get('name')}, size={file_info.get('size')}")
+            asyncio.create_task(self.save_file_task(stream, file_info, file_info['from'], sid_to_clean=sid))
+        else:
+            logging.warning(f"DEBUG IBB: NO MATCH FOR sid={sid}. Available SIDs: {list(self.pending_files.keys())}")
+
+    def handle_ibb_data(self, stream):
+        logging.debug(f"DEBUG IBB: DATA RECEIVED sid={stream.sid}, len={len(stream.data or b'')}")
+
+    def handle_ibb_end(self, stream):
+        logging.info(f"DEBUG IBB: STREAM END sid={stream.sid}")
+
     # Асинхронный цикл очистки зависших передач
     async def cleanup_pending_files(self):
         while True:
@@ -286,6 +333,9 @@ class OBBFastBot(ClientXMPP):
         self['xep_0030'].add_feature('urn:xmpp:jingle:1')
         self['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
         self['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
+        self['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
+        self['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
+        self['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
 
         # Отправляем присутствие (online)
         self.send_presence()
