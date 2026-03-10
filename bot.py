@@ -177,11 +177,31 @@ class OBBFastBot(ClientXMPP):
 
         try:
             content = jingle.find('{urn:xmpp:jingle:1}content')
-            description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
-            file_tag = description.find('{urn:xmpp:jingle:apps:file-transfer:5}file')
+            if content is None:
+                logging.error(f"Jingle session-initiate missing <content/>: sid={sid}")
+                return
 
-            fname = os.path.basename(file_tag.findtext('{urn:xmpp:jingle:apps:file-transfer:5}name')).replace(' ', '_')
+            c_name = content.get('name')
+            c_creator = content.get('creator', 'initiator')
+
+            description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
+            if description is None:
+                 logging.error(f"Jingle session-initiate missing <description/>: sid={sid}")
+                 return
+
+            file_tag = description.find('{urn:xmpp:jingle:apps:file-transfer:5}file')
+            if file_tag is None:
+                 logging.error(f"Jingle session-initiate missing <file/>: sid={sid}")
+                 return
+
+            fname = file_tag.findtext('{urn:xmpp:jingle:apps:file-transfer:5}name')
+            if not fname:
+                fname = "jingle_file"
+            fname = os.path.basename(fname).replace(' ', '_')
+
             fsize = int(file_tag.findtext('{urn:xmpp:jingle:apps:file-transfer:5}size') or 0)
+
+            logging.info(f"JINGLE REQUEST: {fname} ({fsize} bytes) from {peer_jid}, sid={sid}, content_name={c_name}")
 
             user_dir, _ = self.get_user_info(peer_jid)
             if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
@@ -197,7 +217,9 @@ class OBBFastBot(ClientXMPP):
                 'size': fsize,
                 'from': peer_jid.bare,
                 'timestamp': asyncio.get_event_loop().time(),
-                'jingle': True
+                'jingle': True,
+                'content_name': c_name,
+                'content_creator': c_creator
             }
 
             # Предпочитаем S5B
@@ -221,6 +243,7 @@ class OBBFastBot(ClientXMPP):
             reply.send()
 
     async def accept_jingle_ibb(self, iq, sid, transport):
+        info = self.pending_files[sid]
         block_size = transport.get('block-size', '4096')
         ibb_sid = transport.get('sid', sid)
 
@@ -230,14 +253,15 @@ class OBBFastBot(ClientXMPP):
 
         reply = iq.reply()
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
-        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator='initiator', name='file-transfer')
+        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator=info['content_creator'], name=info['content_name'])
         ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
-        ET.SubElement(content, '{urn:xmpp:jingle:transports:ibb:1}transport', sid=ibb_sid, block_size=block_size)
+        ET.SubElement(content, '{urn:xmpp:jingle:transports:ibb:1}transport', sid=ibb_sid, **{'block-size': block_size})
         reply.append(jingle)
         reply.send()
         logging.info(f"Jingle session accepted (IBB): sid={sid}, ibb_sid={ibb_sid}")
 
     async def accept_jingle_s5b(self, iq, sid, transport):
+        info = self.pending_files[sid]
         dst_sid = transport.get('sid', sid)
 
         # Переносим инфу
@@ -254,7 +278,7 @@ class OBBFastBot(ClientXMPP):
 
         reply = iq.reply()
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
-        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator='initiator', name='file-transfer')
+        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator=info['content_creator'], name=info['content_name'])
         ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
         ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=dst_sid)
         reply.append(jingle)
@@ -729,12 +753,13 @@ class OBBFastBot(ClientXMPP):
     # Обработчик начала IBB стрима
     def handle_ibb_stream(self, stream):
         sid = stream.sid
+        logging.info(f"IBB STREAM ATTEMPT: sid={sid}")
         file_info = self.pending_files.get(sid)
         if file_info:
-            logging.info(f"IBB STREAM START: sid={sid}")
+            logging.info(f"IBB STREAM START: sid={sid}, file={file_info.get('name')}")
             asyncio.create_task(self.save_file_task(stream, file_info, file_info['from'], sid_to_clean=sid))
         else:
-            logging.warning(f"IBB STREAM: Unknown SID {sid}")
+            logging.warning(f"IBB STREAM: Unknown SID {sid}. Pending SIDs: {list(self.pending_files.keys())}")
 
 
     # Обработчик запроса на HTTP Upload (XEP-0363)
@@ -976,14 +1001,17 @@ class OBBFastBot(ClientXMPP):
 
                     # Для Jingle нужно отправить transport-info с candidate-used
                     if jingle_sid:
-                        iq = self.make_iq_set()
-                        iq['to'] = peer_jid
-                        jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='transport-info', sid=jingle_sid)
-                        content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator='initiator', name='file-transfer')
-                        transport = ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=sid)
-                        ET.SubElement(transport, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', jid=h_jid)
-                        iq.append(jingle)
-                        iq.send()
+                        info = self.pending_files.get(sid)
+                        if info:
+                            iq = self.make_iq_set()
+                            iq['to'] = peer_jid
+                            jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='transport-info', sid=jingle_sid)
+                            content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator=info['content_creator'], name=info['content_name'])
+                            transport = ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=sid)
+                            ET.SubElement(transport, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', jid=h_jid)
+                            iq.append(jingle)
+                            iq.send()
+                            logging.info(f"Jingle transport-info SENT: sid={jingle_sid}, candidate={h_jid}")
 
                     await self.save_file_task(reader, file_info, peer_jid, sid_to_clean=sid)
                     writer.close()
@@ -1017,12 +1045,16 @@ class OBBFastBot(ClientXMPP):
                     elif hasattr(stream, 'recv'):
                         chunk = await stream.recv()
                     else:
+                        logging.error(f"DOWNLOAD ERROR: Stream object has no read/recv: {type(stream)}")
                         break
 
                     if not chunk:
+                        logging.warning(f"DOWNLOAD: Stream ended early for {fname}: got {received}/{file_info['size']}")
                         break
                     await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
                     received += len(chunk)
+                    if received % 1048576 == 0:
+                         logging.info(f"DOWNLOAD PROGRESS: {fname} {received}/{file_info['size']}")
 
                 f.flush()
                 await asyncio.get_event_loop().run_in_executor(None, os.fsync, f.fileno())
