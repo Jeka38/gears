@@ -208,6 +208,9 @@ class OBBFastBot(ClientXMPP):
             transport_s5b = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             transport_ibb = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
 
+            # Согласно XEP-0166, сначала нужно подтвердить получение IQ (ответить пустым result)
+            iq.reply().send()
+
             if transport_s5b is not None:
                 await self.accept_jingle_s5b(iq, sid, transport_s5b)
             elif transport_ibb is not None:
@@ -234,13 +237,15 @@ class OBBFastBot(ClientXMPP):
         if ibb_sid != sid:
             self.pending_files[ibb_sid] = info
 
-        reply = iq.reply()
+        # Отправляем session-accept как НОВЫЙ IQ set
+        accept_iq = self.make_iq_set()
+        accept_iq['to'] = iq['from']
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
         content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator=info['content_creator'], name=info['content_name'])
         ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
         ET.SubElement(content, '{urn:xmpp:jingle:transports:ibb:1}transport', sid=ibb_sid, **{'block-size': block_size})
-        reply.append(jingle)
-        reply.send()
+        accept_iq.append(jingle)
+        accept_iq.send()
         logging.info(f"Jingle session accepted (IBB): sid={sid}, ibb_sid={ibb_sid}")
 
         # После session-accept отправить session-info
@@ -271,13 +276,15 @@ class OBBFastBot(ClientXMPP):
                 'jid': candidate.get('jid')
             })
 
-        reply = iq.reply()
+        # Отправляем session-accept как НОВЫЙ IQ set
+        accept_iq = self.make_iq_set()
+        accept_iq['to'] = iq['from']
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
         content = ET.SubElement(jingle, '{urn:xmpp:jingle:1}content', creator=info['content_creator'], name=info['content_name'])
         ET.SubElement(content, '{urn:xmpp:jingle:apps:file-transfer:5}description')
         ET.SubElement(content, '{urn:xmpp:jingle:transports:s5b:1}transport', sid=dst_sid)
-        reply.append(jingle)
-        reply.send()
+        accept_iq.append(jingle)
+        accept_iq.send()
         logging.info(f"Jingle session accepted (S5B): sid={sid}, dst_sid={dst_sid}")
 
         # Шаг 3: После session-accept отправить session-info
