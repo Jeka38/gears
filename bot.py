@@ -102,6 +102,8 @@ class OBBFastBot(ClientXMPP):
 
         # Обработчики для IBB
         self.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        self.add_event_handler("ibb_stream_data", self.handle_ibb_data)
+        self.add_event_handler("ibb_stream_end", self.handle_ibb_end)
 
         # Обработка подписки на присутствие
         self.add_event_handler("presence_subscribe", self.handle_presence_subscribe)
@@ -168,6 +170,7 @@ class OBBFastBot(ClientXMPP):
         # Проверка белого списка
         if not self.is_allowed(peer_jid):
             logging.info(f"ACCESS DENIED (Jingle) from {peer_jid}")
+            self.send_message(mto=peer_jid, mbody="❌ Доступ запрещён. Вы не в белом списке.", mtype='chat')
             if ADMIN_JID:
                 self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка Jingle передачи от {peer_jid}", mtype='chat')
             reply = iq.reply()
@@ -206,7 +209,7 @@ class OBBFastBot(ClientXMPP):
             user_dir, _ = self.get_user_info(peer_jid)
             if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 logging.info(f"QUOTA EXCEEDED for {peer_jid}")
-                self.send_message(mto=peer_jid, mbody="⚠ Квота превышена!", mtype='chat')
+                self.send_message(mto=peer_jid, mbody="⚠ Квота превышена! Пожалуйста, удалите старые файлы.", mtype='chat')
                 reply = iq.reply()
                 reply['type'] = 'error'
                 reply['error']['condition'] = 'not-acceptable'
@@ -231,6 +234,7 @@ class OBBFastBot(ClientXMPP):
             elif transport_ibb is not None:
                 await self.accept_jingle_ibb(iq, sid, transport_ibb)
             else:
+                self.send_message(mto=peer_jid, mbody="⚠ Не найден подходящий транспорт для передачи файла (нужен SOCKS5 или IBB).", mtype='chat')
                 reply = iq.reply()
                 reply['type'] = 'error'
                 reply['error']['condition'] = 'feature-not-implemented'
@@ -245,11 +249,9 @@ class OBBFastBot(ClientXMPP):
     async def accept_jingle_ibb(self, iq, sid, transport):
         info = self.pending_files[sid]
         block_size = transport.get('block-size', '4096')
-        ibb_sid = transport.get('sid', sid)
 
-        # Переносим инфу о файле на IBB SID если он отличается
-        if ibb_sid != sid:
-            self.pending_files[ibb_sid] = self.pending_files[sid]
+        # Фиксируем одинаковый SID для Jingle и IBB по требованию
+        ibb_sid = sid
 
         reply = iq.reply()
         jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-accept', sid=sid, responder=self.boundjid.full)
@@ -259,6 +261,18 @@ class OBBFastBot(ClientXMPP):
         reply.append(jingle)
         reply.send()
         logging.info(f"Jingle session accepted (IBB): sid={sid}, ibb_sid={ibb_sid}")
+
+        # Шаг 3: После session-accept отправить session-info
+        self.send_jingle_session_info(iq['from'], sid, info)
+
+    def send_jingle_session_info(self, mto, sid, info):
+        iq = self.make_iq_set()
+        iq['to'] = mto
+        jingle = ET.Element('{urn:xmpp:jingle:1}jingle', action='session-info', sid=sid, responder=self.boundjid.full)
+        # Пустой session-info или с какой-то инфой
+        iq.append(jingle)
+        iq.send()
+        logging.info(f"Jingle session-info SENT: sid={sid}")
 
     async def accept_jingle_s5b(self, iq, sid, transport):
         info = self.pending_files[sid]
@@ -284,6 +298,9 @@ class OBBFastBot(ClientXMPP):
         reply.append(jingle)
         reply.send()
         logging.info(f"Jingle session accepted (S5B): sid={sid}, dst_sid={dst_sid}")
+
+        # Шаг 3: После session-accept отправить session-info
+        self.send_jingle_session_info(iq['from'], sid, info)
 
         # Запускаем коннект в фоне
         asyncio.create_task(self._socks5_connect_and_save(dst_sid, iq['from'], hosts, jingle_sid=sid))
@@ -753,13 +770,19 @@ class OBBFastBot(ClientXMPP):
     # Обработчик начала IBB стрима
     def handle_ibb_stream(self, stream):
         sid = stream.sid
-        logging.info(f"IBB STREAM ATTEMPT: sid={sid}")
+        logging.info(f"DEBUG IBB: STREAM START ATTEMPT sid={sid}")
         file_info = self.pending_files.get(sid)
         if file_info:
-            logging.info(f"IBB STREAM START: sid={sid}, file={file_info.get('name')}")
+            logging.info(f"DEBUG IBB: MATCH FOUND sid={sid}, file={file_info.get('name')}, size={file_info.get('size')}")
             asyncio.create_task(self.save_file_task(stream, file_info, file_info['from'], sid_to_clean=sid))
         else:
-            logging.warning(f"IBB STREAM: Unknown SID {sid}. Pending SIDs: {list(self.pending_files.keys())}")
+            logging.warning(f"DEBUG IBB: NO MATCH FOR sid={sid}. Available SIDs: {list(self.pending_files.keys())}")
+
+    def handle_ibb_data(self, stream):
+        logging.debug(f"DEBUG IBB: DATA RECEIVED sid={stream.sid}, len={len(stream.data or b'')}")
+
+    def handle_ibb_end(self, stream):
+        logging.info(f"DEBUG IBB: STREAM END sid={stream.sid}")
 
 
     # Обработчик запроса на HTTP Upload (XEP-0363)
@@ -1049,10 +1072,11 @@ class OBBFastBot(ClientXMPP):
                         break
 
                     if not chunk:
-                        logging.warning(f"DOWNLOAD: Stream ended early for {fname}: got {received}/{file_info['size']}")
+                        logging.warning(f"DEBUG IBB: STREAM ENDED EARLY for {fname}: got {received}/{file_info['size']}")
                         break
                     await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
                     received += len(chunk)
+                    logging.debug(f"DEBUG IBB: WROTE CHUNK sid={sid_to_clean}, chunk_len={len(chunk)}, total={received}")
                     if received % 1048576 == 0:
                          logging.info(f"DOWNLOAD PROGRESS: {fname} {received}/{file_info['size']}")
 
