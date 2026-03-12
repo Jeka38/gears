@@ -125,6 +125,38 @@ class Database:
         finally:
             conn.close()
 
+    def add_to_blacklist(self, entry):
+        entry = entry.lower()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (entry TEXT PRIMARY KEY)")
+                cursor.execute("INSERT OR IGNORE INTO blacklist (entry) VALUES (?)", (entry,))
+        finally:
+            conn.close()
+
+    def remove_from_blacklist(self, entry):
+        entry = entry.lower()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (entry TEXT PRIMARY KEY)")
+                cursor.execute("DELETE FROM blacklist WHERE entry = ?", (entry,))
+        finally:
+            conn.close()
+
+    def get_blacklist(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (entry TEXT PRIMARY KEY)")
+            cursor.execute("SELECT entry FROM blacklist")
+            return {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
     def get_user_folder(self, jid):
         jid = jid.lower()
         conn = sqlite3.connect(self.db_path)
@@ -282,6 +314,11 @@ class OBBFastBot(ClientXMPP):
         if ADMIN_JID and bare_jid == ADMIN_JID.lower():
             return True
 
+        # Проверка чёрного списка
+        blacklist = self.db.get_blacklist()
+        if bare_jid in blacklist or jid.domain.lower() in blacklist:
+            return False
+
         whitelist = self.db.get_whitelist()
         if '*' in whitelist:
             return True
@@ -324,10 +361,12 @@ class OBBFastBot(ClientXMPP):
         bare_jid = jid.bare.lower()
         user_hash = self.db.get_user_folder(bare_jid)
 
+        is_new = False
         if not user_hash:
             # Если папки ещё нет в БД, создаём новый хеш
             user_hash = hashlib.md5(bare_jid.encode()).hexdigest()
             self.db.set_user_folder(bare_jid, user_hash)
+            is_new = True
 
         # Формируем путь к папке пользователя
         user_dir = os.path.join(self.dest_dir, user_hash)
@@ -335,8 +374,12 @@ class OBBFastBot(ClientXMPP):
         # Создаём папку, если её ещё нет
         if not os.path.exists(user_dir):
             os.makedirs(user_dir)
+            is_new = True
+
+        if is_new:
             # Уведомляем администратора о новом пользователе
-            if ADMIN_JID:
+            notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
+            if ADMIN_JID and notify_level in ('all', 'registrations'):
                 self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {bare_jid} ({user_hash})", mtype='chat')
 
         # Возвращаем путь к папке и хеш
@@ -356,21 +399,29 @@ class OBBFastBot(ClientXMPP):
             size /= 1024
         return f"{size:.1f}GB"
 
-    def get_help_text(self, is_admin=False):
+    def get_help_text(self, is_admin=False, user_hash=None):
         text = (
             "команды:\n"
             "ls - список ссылок на файлы в папке пользователя.\n"
             "ls <-s> - простой список файлов. Пример: ls -s\n"
             "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
             "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
+            "priv - сделать архив приватным (создать index.html).\n"
+            "pub - сделать архив публичным (удалить index.html).\n"
             "ping - проверить доступность бота.\n"
             "help или ? - список команд."
         )
+        if user_hash:
+            text += f"\n\n📂 Ваш архив: {self.base_url}/{user_hash}/"
+            text += "\nЧтобы запретить просмотр списка файлов через браузер, используйте команду priv."
+
         if is_admin:
             text += (
                 "\n\n🔧 Админ-команды:\n"
                 "add <jid|domain|*> - разрешить доступ (используйте * чтобы разрешить всем).\n"
                 "del <jid|domain|*> - запретить доступ.\n"
+                "block <jid|domain> - добавить в чёрный список.\n"
+                "unblock <jid|domain> - убрать из чёрного списка.\n"
                 "list - показать белый список."
             )
         return text
@@ -381,7 +432,8 @@ class OBBFastBot(ClientXMPP):
         logging.info(f"🆕 Запрос подписки от {jid}")
 
         # Уведомляем администратора
-        if ADMIN_JID:
+        notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
+        if ADMIN_JID and notify_level == 'all':
             self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку", mtype='chat')
 
         # Автоматически подтверждаем подписку
@@ -390,8 +442,9 @@ class OBBFastBot(ClientXMPP):
         self.send_presence(pto=jid, ptype='subscribe')
 
         # Приветственное сообщение
-        is_admin = ADMIN_JID and jid == ADMIN_JID
-        welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text(is_admin)}"
+        is_admin = ADMIN_JID and jid == ADMIN_JID.lower()
+        _, user_hash = self.get_user_info(presence['from'])
+        welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text(is_admin, user_hash)}"
         self.send_message(mto=jid, mbody=welcome_msg, mtype='chat')
 
     # Обработчик подтверждения подписки
@@ -421,11 +474,15 @@ class OBBFastBot(ClientXMPP):
         if msg['type'] not in ('chat', 'normal') or not msg['body']:
             return
 
-        # Проверка белого списка
+        # Проверка разрешений
         if not self.is_allowed(msg['from']):
             logging.info(f"ACCESS DENIED (msg) from {msg['from']}")
-            if ADMIN_JID:
+            notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
+            if ADMIN_JID and notify_level == 'all':
                 self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}", mtype='chat')
+            self.send_message(mto=msg['from'],
+                              mbody=f"У вас нет прав для пользования ботом. Обратитесь к {ADMIN_JID}",
+                              mtype='chat')
             return
 
         # Разбиваем сообщение на части
@@ -444,9 +501,9 @@ class OBBFastBot(ClientXMPP):
         # Команда помощи
         if cmd in ('help', '?'):
             if len(parts) != 1: return
-            is_admin = ADMIN_JID and msg['from'].bare == ADMIN_JID
+            is_admin = ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower()
             used = self.get_dir_size(user_dir)
-            help_text = self.get_help_text(is_admin) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
+            help_text = self.get_help_text(is_admin, user_hash) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
             reply(help_text)
 
         # Команда пинга
@@ -503,16 +560,20 @@ class OBBFastBot(ClientXMPP):
 
         # Команда удаления файлов
         elif cmd == 'rm':
-            if len(parts) != 2: return
+            if not (2 <= len(parts) <= 3): return
             files = sorted(os.listdir(user_dir))
             if not files:
                 return reply("📁 Папка пуста")
 
             if parts[1] == '*':
-                for f in files:
-                    os.remove(os.path.join(user_dir, f))
-                reply("🗑 Все файлы удалены.")
+                if len(parts) == 3 and parts[2].lower() == 'confirm':
+                    for f in files:
+                        os.remove(os.path.join(user_dir, f))
+                    reply("🗑 Все файлы удалены.")
+                else:
+                    reply("⚠ Чтобы удалить ВСЕ файлы, напишите: rm * confirm")
             else:
+                if len(parts) != 2: return
                 try:
                     indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())), reverse=True)
                 except ValueError: return
@@ -529,7 +590,25 @@ class OBBFastBot(ClientXMPP):
                 if removed:
                     reply(f"🗑 Удалено файлов: {len(removed)}")
 
-        # Админ-команды для управления белым списком
+        # Дополнительные команды пользователя
+        elif cmd == 'priv':
+            index_path = os.path.join(user_dir, 'index.html')
+            if not os.path.exists(index_path):
+                with open(index_path, 'w') as f:
+                    f.write("<html><body><h1>Private Archive</h1></body></html>")
+                reply("🔒 Архив теперь приватный (создан index.html)")
+            else:
+                reply("ℹ Архив уже приватный.")
+
+        elif cmd == 'pub':
+            index_path = os.path.join(user_dir, 'index.html')
+            if os.path.exists(index_path):
+                os.remove(index_path)
+                reply("🔓 Архив теперь публичный (удалён index.html)")
+            else:
+                reply("ℹ Архив уже публичный.")
+
+        # Админ-команды для управления списками
         if ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower():
             if cmd == 'add' and len(parts) == 2:
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
@@ -544,7 +623,7 @@ class OBBFastBot(ClientXMPP):
                     if '*' in added:
                         reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
                     else:
-                        reply(f"➕ Добавлено: {', '.join(added)}")
+                        reply(f"➕ Добавлено в белый список: {', '.join(added)}")
                 else:
                     reply("⚠ Неверный формат. Используйте user@domain, domain или *")
 
@@ -558,22 +637,53 @@ class OBBFastBot(ClientXMPP):
                         removed.append(entry)
 
                 if removed:
-                    reply(f"➖ Удалено: {', '.join(removed)}")
+                    reply(f"➖ Удалено из белого списка: {', '.join(removed)}")
                 else:
-                    reply("❓ Ничего не найдено для удаления.")
+                    reply("❓ Ничего не найдено для удаления из белого списка.")
+
+            elif cmd == 'block' and len(parts) == 2:
+                entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
+                added = []
+                for entry in entries:
+                    if '@' in entry or '.' in entry:
+                        self.db.add_to_blacklist(entry)
+                        added.append(entry)
+                if added:
+                    reply(f"🚫 Добавлено в чёрный список: {', '.join(added)}")
+                else:
+                    reply("⚠ Неверный формат. Используйте user@domain или domain")
+
+            elif cmd == 'unblock' and len(parts) == 2:
+                entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
+                blacklist = self.db.get_blacklist()
+                removed = []
+                for entry in entries:
+                    if entry in blacklist:
+                        self.db.remove_from_blacklist(entry)
+                        removed.append(entry)
+                if removed:
+                    reply(f"✅ Удалено из чёрного списка: {', '.join(removed)}")
+                else:
+                    reply("❓ Ничего не найдено для удаления из чёрного списка.")
 
             elif cmd == 'list' and len(parts) == 1:
                 whitelist = self.db.get_whitelist()
-                res = "\n".join(sorted(whitelist))
-                reply(f"📄 Белый список:\n{res or '(пусто)'}")
+                blacklist = self.db.get_blacklist()
+                res_w = "\n".join(sorted(whitelist))
+                res_b = "\n".join(sorted(blacklist))
+                reply(f"📄 Белый список:\n{res_w or '(пусто)'}\n\n🚫 Чёрный список:\n{res_b or '(пусто)'}")
 
     # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
     def handle_raw_si(self, iq):
-        # Проверка белого списка
+        # Проверка разрешений
         if not self.is_allowed(iq['from']):
             logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
-            if ADMIN_JID:
+            notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
+            if ADMIN_JID and notify_level == 'all':
                 self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}", mtype='chat')
+            self.send_message(mto=iq['from'],
+                              mbody=f"У вас нет прав для пользования ботом. Обратитесь к {ADMIN_JID}",
+                              mtype='chat')
             reply = iq.reply()
             reply['type'] = 'error'
             return reply.send()
