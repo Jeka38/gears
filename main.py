@@ -65,8 +65,8 @@ class Database:
         # Проверка, не является ли путь директорией (ошибка Docker volume)
         if os.path.isdir(self.db_path):
             # Если это директория, попробуем использовать файл внутри неё
-            logging.warning(f"ВНИМАНИЕ: Путь {self.db_path} — директория. Используем {self.db_path}/bot.db")
-            self.db_path = os.path.join(self.db_path, "bot.db")
+            logging.warning(f"ВНИМАНИЕ: Путь {self.db_path} — директория. Используем {self.db_path}/bot_data.db")
+            self.db_path = os.path.join(self.db_path, "bot_data.db")
 
         # Убеждаемся, что папка для базы данных существует
         db_dir = os.path.dirname(self.db_path)
