@@ -23,7 +23,7 @@ services:
     # Именно сюда бот будет сохранять полученные файлы
     volumes:
       - ./downloads:/app/downloads
-      - ./whitelist.json:/app/whitelist.json
+      - ./data:/app/data
 
     # Настройки логирования контейнера
     logging:

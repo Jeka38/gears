@@ -16,6 +16,9 @@ import hashlib
 # Импорт модуля для работы с форматом JSON
 import json
 
+# Импорт модуля для работы с SQLite
+import sqlite3
+
 # Импорт модуля для корректной работы с URL (в частности quote для имён файлов)
 import urllib.parse
 
@@ -46,8 +49,102 @@ ADMIN_JID = os.getenv('ADMIN_JID')
 # Путь к файлу белого списка
 WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 
+# Путь к базе данных
+DB_PATH = os.getenv('DB_PATH', '/app/data/bot.db')
+
 # Версия софта
 VERSION = os.getenv('APP_VERSION', '1.1')
+
+
+class Database:
+    def __init__(self, db_path):
+        # Преобразуем в абсолютный путь для надёжности
+        self.db_path = os.path.abspath(db_path)
+        logging.info(f"Инициализация базы данных: {self.db_path}")
+
+        # Проверка, не является ли путь директорией (ошибка Docker volume)
+        if os.path.isdir(self.db_path):
+            # Если это директория, попробуем использовать файл внутри неё
+            logging.warning(f"ВНИМАНИЕ: Путь {self.db_path} — директория. Используем {self.db_path}/bot_data.db")
+            self.db_path = os.path.join(self.db_path, "bot_data.db")
+
+        # Убеждаемся, что папка для базы данных существует
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            logging.info(f"Создание директории для БД: {db_dir}")
+            os.makedirs(db_dir, exist_ok=True)
+
+        self._create_tables()
+
+    def _create_tables(self):
+        logging.info(f"Подключение к SQLite: {self.db_path}")
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS whitelist (
+                        entry TEXT PRIMARY KEY
+                    )
+                """)
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS user_folders (
+                        jid TEXT PRIMARY KEY,
+                        folder_hash TEXT NOT NULL
+                    )
+                """)
+        finally:
+            conn.close()
+
+    def add_to_whitelist(self, entry):
+        entry = entry.lower()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR IGNORE INTO whitelist (entry) VALUES (?)", (entry,))
+        finally:
+            conn.close()
+
+    def remove_from_whitelist(self, entry):
+        entry = entry.lower()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM whitelist WHERE entry = ?", (entry,))
+        finally:
+            conn.close()
+
+    def get_whitelist(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT entry FROM whitelist")
+            return {row[0] for row in cursor.fetchall()}
+        finally:
+            conn.close()
+
+    def get_user_folder(self, jid):
+        jid = jid.lower()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT folder_hash FROM user_folders WHERE jid = ?", (jid,))
+            row = cursor.fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    def set_user_folder(self, jid, folder_hash):
+        jid = jid.lower()
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute("INSERT OR REPLACE INTO user_folders (jid, folder_hash) VALUES (?, ?)", (jid, folder_hash))
+        finally:
+            conn.close()
 
 
 # Основной класс бота — наследуется от ClientXMPP
@@ -68,9 +165,9 @@ class OBBFastBot(ClientXMPP):
         self.pending_files = {}
         asyncio.create_task(self.cleanup_pending_files())
 
-        # Белый список
-        self.whitelist = set()
-        self.load_whitelist()
+        # Инициализация базы данных
+        self.db = Database(DB_PATH)
+        self.migrate_json_to_db()
 
         # Миграция имен файлов (замена пробелов на подчёркивания)
         self.migrate_filenames()
@@ -145,8 +242,9 @@ class OBBFastBot(ClientXMPP):
         # Указываем, что поддерживаем профиль передачи файлов через SI
         self['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
 
-        # Отправляем присутствие (online)
-        self.send_presence()
+        # Отправляем присутствие (online) со статус-сообщением
+        status = os.getenv('STATUS_MESSAGE', 'Для помощи по боту напиши ? или help')
+        self.send_presence(pstatus=status)
 
         # Запрашиваем ростер (список контактов)
         await self.get_roster()
@@ -154,34 +252,21 @@ class OBBFastBot(ClientXMPP):
         # Пишем в лог, что бот успешно запустился
         logging.info(f"✅ БОТ ЗАПУЩЕН: {self.boundjid}")
 
-    def load_whitelist(self):
+    def migrate_json_to_db(self):
         try:
             if os.path.exists(WHITELIST_FILE):
-
-                if os.path.isdir(WHITELIST_FILE):
-                    logging.warning(f"{WHITELIST_FILE} is directory, recreating file")
+                if os.path.isfile(WHITELIST_FILE):
+                    with open(WHITELIST_FILE, 'r') as f:
+                        data = json.load(f)
+                        for entry in data:
+                            self.db.add_to_whitelist(entry)
+                    logging.info(f"MIGRATED {len(data)} entries from {WHITELIST_FILE} to database")
+                    os.remove(WHITELIST_FILE)
+                elif os.path.isdir(WHITELIST_FILE):
+                    logging.warning(f"{WHITELIST_FILE} is a directory, removing it")
                     os.rmdir(WHITELIST_FILE)
-
-                with open(WHITELIST_FILE, 'r') as f:
-                    data = json.load(f)
-                    self.whitelist = set(data)
-
-            else:
-                self.whitelist = set()
-                with open(WHITELIST_FILE, 'w') as f:
-                    json.dump([], f)
-
         except Exception as e:
-            logging.error(f"LOAD WHITELIST ERROR: {e}")
-            self.whitelist = set()
-
-    # Сохраняем белый список в файл
-    def save_whitelist(self):
-        try:
-            with open(WHITELIST_FILE, 'w') as f:
-                json.dump(list(sorted(self.whitelist)), f, indent=4)
-        except Exception as e:
-            logging.error(f"SAVE WHITELIST ERROR: {e}")
+            logging.error(f"MIGRATION ERROR: {e}")
 
     # Логирование входящего XML
     def log_xml_in(self, xml):
@@ -193,16 +278,16 @@ class OBBFastBot(ClientXMPP):
 
     # Проверяем, разрешён ли доступ данному JID
     def is_allowed(self, jid):
-        bare_jid = jid.bare
-        if ADMIN_JID and bare_jid == ADMIN_JID:
+        bare_jid = jid.bare.lower()
+        if ADMIN_JID and bare_jid == ADMIN_JID.lower():
             return True
-        # По умолчанию разрешаем сервер аккаунта бота
-        if jid.domain == self.boundjid.domain:
+
+        whitelist = self.db.get_whitelist()
+        if '*' in whitelist:
             return True
-        if '*' in self.whitelist:
-            return True
-        domain = jid.domain
-        return bare_jid in self.whitelist or domain in self.whitelist
+
+        domain = jid.domain.lower()
+        return bare_jid in whitelist or domain in whitelist
 
     # Рекурсивная замена пробелов на подчёркивания в именах файлов
     def migrate_filenames(self):
@@ -236,8 +321,13 @@ class OBBFastBot(ClientXMPP):
 
     # Получаем (и при необходимости создаём) персональную папку пользователя
     def get_user_info(self, jid):
-        # Берём bare JID (без ресурса) и считаем от него md5
-        user_hash = hashlib.md5(jid.bare.encode()).hexdigest()
+        bare_jid = jid.bare.lower()
+        user_hash = self.db.get_user_folder(bare_jid)
+
+        if not user_hash:
+            # Если папки ещё нет в БД, создаём новый хеш
+            user_hash = hashlib.md5(bare_jid.encode()).hexdigest()
+            self.db.set_user_folder(bare_jid, user_hash)
 
         # Формируем путь к папке пользователя
         user_dir = os.path.join(self.dest_dir, user_hash)
@@ -247,7 +337,7 @@ class OBBFastBot(ClientXMPP):
             os.makedirs(user_dir)
             # Уведомляем администратора о новом пользователе
             if ADMIN_JID:
-                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {jid.bare} ({user_hash})", mtype='chat')
+                self.send_message(mto=ADMIN_JID, mbody=f"🆕 Новый пользователь: {bare_jid} ({user_hash})", mtype='chat')
 
         # Возвращаем путь к папке и хеш
         return user_dir, user_hash
@@ -440,25 +530,41 @@ class OBBFastBot(ClientXMPP):
                     reply(f"🗑 Удалено файлов: {len(removed)}")
 
         # Админ-команды для управления белым списком
-        if ADMIN_JID and msg['from'].bare == ADMIN_JID:
+        if ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower():
             if cmd == 'add' and len(parts) == 2:
-                entry = parts[1].lower()
-                self.whitelist.add(entry)
-                self.save_whitelist()
-                if entry == '*':
-                    reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
+                entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
+                added = []
+                for entry in entries:
+                    # Валидация: * или user@domain или domain
+                    if entry == '*' or '@' in entry or '.' in entry:
+                        self.db.add_to_whitelist(entry)
+                        added.append(entry)
+
+                if added:
+                    if '*' in added:
+                        reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
+                    else:
+                        reply(f"➕ Добавлено: {', '.join(added)}")
                 else:
-                    reply(f"➕ Добавлено: {entry}")
+                    reply("⚠ Неверный формат. Используйте user@domain, domain или *")
+
             elif cmd == 'del' and len(parts) == 2:
-                entry = parts[1].lower()
-                if entry in self.whitelist:
-                    self.whitelist.remove(entry)
-                    self.save_whitelist()
-                    reply(f"➖ Удалено: {entry}")
+                entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
+                whitelist = self.db.get_whitelist()
+                removed = []
+                for entry in entries:
+                    if entry in whitelist:
+                        self.db.remove_from_whitelist(entry)
+                        removed.append(entry)
+
+                if removed:
+                    reply(f"➖ Удалено: {', '.join(removed)}")
                 else:
-                    reply(f"❓ Не найдено: {entry}")
+                    reply("❓ Ничего не найдено для удаления.")
+
             elif cmd == 'list' and len(parts) == 1:
-                res = "\n".join(sorted(self.whitelist))
+                whitelist = self.db.get_whitelist()
+                res = "\n".join(sorted(whitelist))
                 reply(f"📄 Белый список:\n{res or '(пусто)'}")
 
     # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
