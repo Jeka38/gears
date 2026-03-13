@@ -19,6 +19,15 @@ import json
 # Импорт модуля для работы с SQLite
 import sqlite3
 
+# Импорт модуля для работы с правами доступа и типами файлов
+import stat
+
+# Импорт модуля для рекурсивного удаления директорий
+import shutil
+
+# Импорт модуля для работы с датой и временем
+import datetime
+
 # Импорт модуля для корректной работы с URL (в частности quote для имён файлов)
 import urllib.parse
 
@@ -88,6 +97,11 @@ class Database:
                     )
                 """)
                 cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS blacklist (
+                        entry TEXT PRIMARY KEY
+                    )
+                """)
+                cursor.execute("""
                     CREATE TABLE IF NOT EXISTS user_folders (
                         jid TEXT PRIMARY KEY,
                         folder_hash TEXT NOT NULL
@@ -131,7 +145,6 @@ class Database:
         try:
             with conn:
                 cursor = conn.cursor()
-                cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (entry TEXT PRIMARY KEY)")
                 cursor.execute("INSERT OR IGNORE INTO blacklist (entry) VALUES (?)", (entry,))
         finally:
             conn.close()
@@ -142,7 +155,6 @@ class Database:
         try:
             with conn:
                 cursor = conn.cursor()
-                cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (entry TEXT PRIMARY KEY)")
                 cursor.execute("DELETE FROM blacklist WHERE entry = ?", (entry,))
         finally:
             conn.close()
@@ -151,7 +163,6 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         try:
             cursor = conn.cursor()
-            cursor.execute("CREATE TABLE IF NOT EXISTS blacklist (entry TEXT PRIMARY KEY)")
             cursor.execute("SELECT entry FROM blacklist")
             return {row[0] for row in cursor.fetchall()}
         finally:
@@ -395,15 +406,53 @@ class OBBFastBot(ClientXMPP):
     def format_size(self, size):
         for unit in ['B', 'kB', 'MB', 'GB']:
             if size < 1024:
+                if unit == 'B':
+                    return f"{int(size)}{unit}"
                 return f"{size:.1f}{unit}"
             size /= 1024
         return f"{size:.1f}GB"
+
+    def get_all_items(self, user_dir):
+        items = []
+        for root, dirs, files in os.walk(user_dir):
+            rel_root = os.path.relpath(root, user_dir)
+            if rel_root == ".":
+                rel_root = ""
+
+            for d in dirs:
+                path = os.path.join(rel_root, d)
+                items.append(path + "/")
+            for f in files:
+                path = os.path.join(rel_root, f)
+                items.append(path)
+        return sorted(items)
+
+    def get_safe_path(self, user_dir, path_str):
+        user_dir = os.path.abspath(user_dir)
+        target_path = os.path.abspath(os.path.join(user_dir, path_str.strip().lstrip('/')))
+        if not target_path.startswith(user_dir):
+            return None
+        return target_path
+
+    def resolve_item(self, user_dir, arg, items):
+        # Попытка разрешить как индекс (1-based)
+        try:
+            idx = int(arg) - 1
+            if 0 <= idx < len(items):
+                return self.get_safe_path(user_dir, items[idx])
+        except ValueError:
+            pass
+        # Иначе трактуем как относительный путь
+        return self.get_safe_path(user_dir, arg)
 
     def get_help_text(self, is_admin=False, user_hash=None):
         text = (
             "команды:\n"
             "ls - список ссылок на файлы в папке пользователя.\n"
-            "ls <-s> - простой список файлов. Пример: ls -s\n"
+            "ls <-s|-l> - список файлов (-s: размер, -l: подробно). Пример: ls -l\n"
+            "mkdir <путь> - создать директорию.\n"
+            "rmdir <номер|путь> - удалить пустую директорию.\n"
+            "mv <номер|путь> <номер|путь> - переместить/переименовать.\n"
             "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
             "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
             "priv - сделать архив приватным (создать index.html).\n"
@@ -511,39 +560,103 @@ class OBBFastBot(ClientXMPP):
             if len(parts) != 1: return
             reply("pong")
 
+        elif cmd == 'mkdir':
+            if len(parts) != 2: return
+            target = self.get_safe_path(user_dir, parts[1])
+            if target:
+                try:
+                    os.makedirs(target, exist_ok=True)
+                    reply(f"📁 Директория создана: {os.path.relpath(target, user_dir)}")
+                except Exception as e:
+                    reply(f"❌ Ошибка: {e}")
+            else:
+                reply("❌ Недопустимый путь")
+
+        elif cmd == 'rmdir':
+            if len(parts) != 2: return
+            items = self.get_all_items(user_dir)
+            target = self.resolve_item(user_dir, parts[1], items)
+            if target and os.path.isdir(target):
+                try:
+                    os.rmdir(target)
+                    reply(f"🗑 Директория удалена: {os.path.relpath(target, user_dir)}")
+                except OSError:
+                    reply("❌ Ошибка: Директория не пуста или не существует")
+                except Exception as e:
+                    reply(f"❌ Ошибка: {e}")
+            else:
+                reply("❌ Директория не найдена")
+
+        elif cmd == 'mv':
+            if len(parts) != 3: return
+            items = self.get_all_items(user_dir)
+            src = self.resolve_item(user_dir, parts[1], items)
+            dst = self.resolve_item(user_dir, parts[2], items)
+            if src and dst and os.path.exists(src):
+                try:
+                    if os.path.isdir(dst):
+                         dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                    os.rename(src, dst)
+                    reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(dst, user_dir)}")
+                except Exception as e:
+                    reply(f"❌ Ошибка: {e}")
+            else:
+                reply("❌ Ошибка в путях или файл не найден")
+
         # Команда показа списка файлов
         elif cmd == 'ls':
             if len(parts) > 2: return
-            files = sorted(os.listdir(user_dir))
-            if not files:
+            items = self.get_all_items(user_dir)
+            if not items:
                 return reply("📁 Папка пуста")
 
             if len(parts) == 2:
                 if parts[1] == '-s':
                     res = []
-                    for i, f in enumerate(files):
-                        size = os.path.getsize(os.path.join(user_dir, f))
-                        res.append(f"{i+1} - {f} [{self.format_size(size)}]")
+                    for i, itm in enumerate(items):
+                        full_path = os.path.join(user_dir, itm)
+                        if os.path.isdir(full_path):
+                            res.append(f"{i+1} - {itm} [dir]")
+                        else:
+                            size = os.path.getsize(full_path)
+                            res.append(f"{i+1} - {itm} [{self.format_size(size)}]")
+                    reply("\n".join(res))
+                elif parts[1] == '-l':
+                    res = []
+                    for i, itm in enumerate(items):
+                        full_path = os.path.join(user_dir, itm)
+                        st = os.stat(full_path)
+                        # Формат разрешений
+                        perms = stat.filemode(st.st_mode)
+                        # Размер
+                        size = self.format_size(st.st_size)
+                        # Дата загрузки/изменения
+                        mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
+                        res.append(f"{i+1} - {perms} {size:>8} {mtime} {itm}")
                     reply("\n".join(res))
                 return
 
             # По умолчанию (просто ls) - список ссылок
             res = []
-            for i, f in enumerate(files):
-                res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+            for i, itm in enumerate(items):
+                if itm.endswith('/'):
+                    res.append(f"{i+1} - {itm} (dir)")
+                else:
+                    res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
             reply("\n".join(res))
 
         # Команда получения ссылки на файл
         elif cmd in ('link', 'lnk'):
             if len(parts) != 2: return
-            files = sorted(os.listdir(user_dir))
-            if not files:
+            items = self.get_all_items(user_dir)
+            if not items:
                 return reply("📁 Папка пуста")
 
             if parts[1] == '*':
                 res = []
-                for i, f in enumerate(files):
-                    res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+                for i, itm in enumerate(items):
+                    if not itm.endswith('/'):
+                        res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
                 reply("\n".join(res))
             else:
                 try:
@@ -552,24 +665,34 @@ class OBBFastBot(ClientXMPP):
 
                 res = []
                 for idx in indices:
-                    if 0 <= idx < len(files):
-                        f = files[idx]
-                        res.append(f"{idx+1} - {self.base_url}/{user_hash}/{self.safe_quote(f)}")
+                    if 0 <= idx < len(items):
+                        itm = items[idx]
+                        if not itm.endswith('/'):
+                            res.append(f"{idx+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
                 if res:
                     reply("\n".join(res))
 
         # Команда удаления файлов
         elif cmd == 'rm':
             if not (2 <= len(parts) <= 3): return
-            files = sorted(os.listdir(user_dir))
-            if not files:
+            items = self.get_all_items(user_dir)
+            if not items:
                 return reply("📁 Папка пуста")
 
             if parts[1] == '*':
                 if len(parts) == 3 and parts[2].lower() == 'confirm':
-                    for f in files:
-                        os.remove(os.path.join(user_dir, f))
-                    reply("🗑 Все файлы удалены.")
+                    # Удаляем всё содержимое user_dir
+                    top_items = os.listdir(user_dir)
+                    for item in top_items:
+                        item_path = os.path.join(user_dir, item)
+                        try:
+                            if os.path.isdir(item_path):
+                                shutil.rmtree(item_path)
+                            else:
+                                os.remove(item_path)
+                        except Exception:
+                            pass
+                    reply("🗑 Все файлы и папки удалены.")
                 else:
                     reply("⚠ Чтобы удалить ВСЕ файлы, напишите: rm * confirm")
             else:
@@ -578,17 +701,21 @@ class OBBFastBot(ClientXMPP):
                     indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())), reverse=True)
                 except ValueError: return
 
-                removed = []
+                removed_count = 0
                 for idx in indices:
-                    if 0 <= idx < len(files):
-                        f = files[idx]
+                    if 0 <= idx < len(items):
+                        itm = items[idx]
+                        path = os.path.join(user_dir, itm)
                         try:
-                            os.remove(os.path.join(user_dir, f))
-                            removed.append(f)
+                            if os.path.isdir(path):
+                                shutil.rmtree(path)
+                            else:
+                                os.remove(path)
+                            removed_count += 1
                         except OSError:
                             pass
-                if removed:
-                    reply(f"🗑 Удалено файлов: {len(removed)}")
+                if removed_count:
+                    reply(f"🗑 Удалено объектов: {removed_count}")
 
         # Дополнительные команды пользователя
         elif cmd == 'priv':
