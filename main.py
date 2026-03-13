@@ -590,18 +590,36 @@ class OBBFastBot(ClientXMPP):
         elif cmd == 'mv':
             if len(parts) != 3: return
             items = self.get_all_items(user_dir)
-            src = self.resolve_item(user_dir, parts[1], items)
-            dst = self.resolve_item(user_dir, parts[2], items)
-            if src and dst and os.path.exists(src):
-                try:
-                    if os.path.isdir(dst):
-                         dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
-                    os.rename(src, dst)
-                    reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(dst, user_dir)}")
-                except Exception as e:
-                    reply(f"❌ Ошибка: {e}")
+            if parts[1] == '*':
+                dst = self.resolve_item(user_dir, parts[2], items)
+                if dst and os.path.isdir(dst):
+                    top_items = os.listdir(user_dir)
+                    moved_count = 0
+                    for item in top_items:
+                        src_path = os.path.join(user_dir, item)
+                        if os.path.abspath(src_path) == os.path.abspath(dst):
+                            continue
+                        try:
+                            os.rename(src_path, os.path.join(dst, item))
+                            moved_count += 1
+                        except Exception:
+                            pass
+                    reply(f"🚚 Перемещено объектов: {moved_count}")
+                else:
+                    reply("❌ Путь назначения должен быть директорией")
             else:
-                reply("❌ Ошибка в путях или файл не найден")
+                src = self.resolve_item(user_dir, parts[1], items)
+                dst = self.resolve_item(user_dir, parts[2], items)
+                if src and dst and os.path.exists(src):
+                    try:
+                        if os.path.isdir(dst):
+                             dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                        os.rename(src, dst)
+                        reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(dst, user_dir)}")
+                    except Exception as e:
+                        reply(f"❌ Ошибка: {e}")
+                else:
+                    reply("❌ Ошибка в путях или файл не найден")
 
         # Команда показа списка файлов
         elif cmd == 'ls':
