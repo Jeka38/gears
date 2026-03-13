@@ -421,12 +421,19 @@ class OBBFastBot(ClientXMPP):
             if rel_root == ".":
                 rel_root = ""
 
+            # Ограничение вложенности: не более 2 уровней директорий
+            if rel_root != "" and rel_root.count(os.sep) >= 2:
+                continue
+
             for d in dirs:
                 path = os.path.join(rel_root, d)
-                items.append(path + "/")
+                if path.count(os.sep) < 2:
+                    items.append(path + "/")
             for f in files:
                 path = os.path.join(rel_root, f)
-                items.append(path)
+                # Файлы могут находиться в директориях 2-го уровня
+                if path.count(os.sep) <= 2:
+                    items.append(path)
         return sorted(items)
 
     def get_safe_path(self, user_dir, path_str):
