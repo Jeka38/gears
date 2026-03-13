@@ -452,10 +452,19 @@ class OBBFastBot(ClientXMPP):
         parts = [p.strip() for p in arg.split(',') if p.strip()]
         for p in parts:
             if '*' in p or '?' in p:
-                matches = fnmatch.filter(items, p)
-                for m in matches:
-                    path = self.get_safe_path(user_dir, m)
-                    if path: resolved.append(path)
+                if '/' not in p:
+                    # Если в шаблоне нет слэша, ищем по имени файла во всех папках
+                    for itm in items:
+                        name = os.path.basename(itm.rstrip('/'))
+                        if fnmatch.fnmatch(name, p):
+                            path = self.get_safe_path(user_dir, itm)
+                            if path: resolved.append(path)
+                else:
+                    # Если слэш есть, фильтруем по полному относительному пути
+                    matches = fnmatch.filter(items, p)
+                    for m in matches:
+                        path = self.get_safe_path(user_dir, m)
+                        if path: resolved.append(path)
             else:
                 path = self.resolve_item(user_dir, p, items)
                 if path: resolved.append(path)
@@ -665,21 +674,22 @@ class OBBFastBot(ClientXMPP):
                 name = os.path.basename(itm.rstrip('/'))
                 if itm.endswith('/'): name += "/"
 
-                # Древовидный префикс
                 if depth > 0:
-                    prefix = "  " * (depth - 1) + "└── "
+                    display_itm = "    " * (depth - 1) + "└── " + name
                 else:
-                    prefix = ""
+                    display_itm = name
 
                 full_path = os.path.join(user_dir, itm)
-                display_itm = f"{prefix}{name}"
 
                 if mode == 'links':
-                    url = f"{self.base_url}/{user_hash}/{self.safe_quote(itm)}"
-                    res.append(f"{i+1} - {display_itm} - {url}")
+                    if itm.endswith('/'):
+                        res.append(f"{i+1} - {display_itm}")
+                    else:
+                        url = f"{self.base_url}/{user_hash}/{self.safe_quote(itm)}"
+                        res.append(f"{i+1} - {display_itm} - {url}")
                 elif mode == 'size':
                     if itm.endswith('/'):
-                        res.append(f"{i+1} - {display_itm} [dir]")
+                        res.append(f"{i+1} - {display_itm} [директория]")
                     else:
                         size = self.format_size(os.path.getsize(full_path))
                         res.append(f"{i+1} - {display_itm} [{size}]")
