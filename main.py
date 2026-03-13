@@ -651,40 +651,47 @@ class OBBFastBot(ClientXMPP):
             if not items:
                 return reply("📁 Папка пуста")
 
+            mode = 'links'
             if len(parts) == 2:
-                if parts[1] == '-s':
-                    res = []
-                    for i, itm in enumerate(items):
-                        full_path = os.path.join(user_dir, itm)
-                        if os.path.isdir(full_path):
-                            res.append(f"{i+1} - {itm} [dir]")
-                        else:
-                            size = os.path.getsize(full_path)
-                            res.append(f"{i+1} - {itm} [{self.format_size(size)}]")
-                    reply("\n".join(res))
-                elif parts[1] == '-l':
-                    res = []
-                    for itm in items:
-                        full_path = os.path.join(user_dir, itm)
-                        st = os.stat(full_path)
-                        # Размер
-                        size = self.format_size(st.st_size)
-                        # Дата загрузки/изменения
-                        mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
-                        if itm.endswith('/'):
-                            res.append(f"{itm} (директория, {mtime})")
-                        else:
-                            res.append(f"{itm} ({size}, загружен {mtime})")
-                    reply("\n".join(res))
-                return
+                if parts[1] == '-s': mode = 'size'
+                elif parts[1] == '-l': mode = 'long'
+                else: return
 
-            # По умолчанию (просто ls) - список ссылок
             res = []
             for i, itm in enumerate(items):
-                if itm.endswith('/'):
-                    res.append(f"{i+1} - {itm} (dir)")
+                depth = itm.count('/')
+                if itm.endswith('/'): depth -= 1
+
+                name = os.path.basename(itm.rstrip('/'))
+                if itm.endswith('/'): name += "/"
+
+                # Древовидный префикс
+                if depth > 0:
+                    prefix = "  " * (depth - 1) + "└── "
                 else:
-                    res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
+                    prefix = ""
+
+                full_path = os.path.join(user_dir, itm)
+                display_itm = f"{prefix}{name}"
+
+                if mode == 'links':
+                    url = f"{self.base_url}/{user_hash}/{self.safe_quote(itm)}"
+                    res.append(f"{i+1} - {display_itm} - {url}")
+                elif mode == 'size':
+                    if itm.endswith('/'):
+                        res.append(f"{i+1} - {display_itm} [dir]")
+                    else:
+                        size = self.format_size(os.path.getsize(full_path))
+                        res.append(f"{i+1} - {display_itm} [{size}]")
+                elif mode == 'long':
+                    st = os.stat(full_path)
+                    size = self.format_size(st.st_size)
+                    mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
+                    if itm.endswith('/'):
+                        res.append(f"{i+1} - {display_itm} (директория, {mtime})")
+                    else:
+                        res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
+
             reply("\n".join(res))
 
         # Команда получения ссылки на файл
