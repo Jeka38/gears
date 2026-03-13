@@ -64,7 +64,7 @@ WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 # Путь к базе данных
 DB_PATH = os.getenv('DB_PATH', '/app/data/bot.db')
 
-# Лимит вложенности директорий
+# Лимит вложенности директорий (не более N уровней)
 MAX_DIR_DEPTH = int(os.getenv('MAX_DIR_DEPTH', 2))
 
 # Версия софта
@@ -373,17 +373,12 @@ class OBBFastBot(ClientXMPP):
             mbody = '\n' + mbody
         super().send_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
 
-    # Получаем (и при необходимости создаём) персональную папку пользователя
+    # Получаем уникальный путь для предотвращения перезаписи
     def get_unique_path(self, path):
         if not os.path.exists(path):
             return path
 
         base, ext = os.path.splitext(path)
-        # Если путь - директория, ext будет пустым, base будет полным путем
-        if os.path.isdir(path) and not path.endswith('/'):
-             # Для директорий без расширения (обычно)
-             pass
-
         counter = 1
         while True:
             new_path = f"{base}_{counter}{ext}"
@@ -391,6 +386,7 @@ class OBBFastBot(ClientXMPP):
                 return new_path
             counter += 1
 
+    # Получаем (и при необходимости создаём) персональную папку пользователя
     def get_user_info(self, jid):
         bare_jid = jid.bare.lower()
         user_hash = self.db.get_user_folder(bare_jid)
@@ -434,28 +430,32 @@ class OBBFastBot(ClientXMPP):
             size /= 1024
         return f"{size:.1f} ГБ".replace('.', ',')
 
+    # Получаем все элементы рекурсивно с ограничением вложенности
     def get_all_items(self, user_dir):
         items = []
+        # Динамически получаем лимит из окружения
+        max_depth = int(os.getenv('MAX_DIR_DEPTH', 2))
         for root, dirs, files in os.walk(user_dir):
             rel_root = os.path.relpath(root, user_dir)
             if rel_root == ".":
                 rel_root = ""
 
             # Ограничение вложенности: не более MAX_DIR_DEPTH уровней директорий
-            if rel_root != "" and rel_root.count(os.sep) >= MAX_DIR_DEPTH:
+            if rel_root != "" and rel_root.count(os.sep) >= max_depth:
                 continue
 
             for d in dirs:
                 path = os.path.join(rel_root, d)
-                if path.count(os.sep) < MAX_DIR_DEPTH:
+                if path.count(os.sep) < max_depth:
                     items.append(path + "/")
             for f in files:
                 path = os.path.join(rel_root, f)
                 # Файлы могут находиться в директориях уровня MAX_DIR_DEPTH
-                if path.count(os.sep) <= MAX_DIR_DEPTH:
+                if path.count(os.sep) <= max_depth:
                     items.append(path)
         return sorted(items)
 
+    # Безопасное получение пути внутри папки пользователя
     def get_safe_path(self, user_dir, path_str):
         user_dir = os.path.abspath(user_dir)
         target_path = os.path.abspath(os.path.join(user_dir, path_str.strip().lstrip('/')))
@@ -463,31 +463,29 @@ class OBBFastBot(ClientXMPP):
             return None
         return target_path
 
+    # Разрешение аргумента как индекса или пути
     def resolve_item(self, user_dir, arg, items):
-        # Попытка разрешить как индекс (1-based)
         try:
             idx = int(arg) - 1
             if 0 <= idx < len(items):
                 return self.get_safe_path(user_dir, items[idx])
         except ValueError:
             pass
-        # Иначе трактуем как относительный путь
         return self.get_safe_path(user_dir, arg)
 
+    # Разрешение списка аргументов (индексы, пути, шаблоны)
     def resolve_items_list(self, user_dir, arg, items):
         resolved = []
         parts = [p.strip() for p in arg.split(',') if p.strip()]
         for p in parts:
             if '*' in p or '?' in p:
                 if '/' not in p:
-                    # Если в шаблоне нет слэша, ищем по имени файла во всех папках
                     for itm in items:
                         name = os.path.basename(itm.rstrip('/'))
                         if fnmatch.fnmatch(name, p):
                             path = self.get_safe_path(user_dir, itm)
                             if path: resolved.append(path)
                 else:
-                    # Если слэш есть, фильтруем по полному относительному пути
                     matches = fnmatch.filter(items, p)
                     for m in matches:
                         path = self.get_safe_path(user_dir, m)
@@ -495,19 +493,18 @@ class OBBFastBot(ClientXMPP):
             else:
                 path = self.resolve_item(user_dir, p, items)
                 if path: resolved.append(path)
-        # Удаляем дубликаты, сохраняя порядок
         return list(dict.fromkeys(resolved))
 
     def get_help_text(self, is_admin=False, user_hash=None):
         text = (
             "команды:\n"
-            "ls - список ссылок на файлы в папке пользователя.\n"
+            "ls - список файлов и каталогов в папке пользователя.\n"
             "ls <-s|-l> - список файлов (-s: размер, -l: подробно). Пример: ls -l\n"
             "mkdir <путь> - создать директорию.\n"
             "rmdir <номер|путь> - удалить пустую директорию.\n"
             "mv <номер|путь> <номер|путь> - переместить/переименовать.\n"
-            "rm <номер>[,<номер>],.. - удаление файлов по его порядковому номеру или rm * - для удаления всех файлов.\n"
-            "link <номер>[,<номер>],.. - получение ссылок на файлы по его номеру или lnk * - для получения ссылок всех файлов.\n"
+            "rm <номер>[,<номер>],.. - удаление файлов по номеру или rm * - для удаления всех файлов.\n"
+            "link <номер>[,<номер>],.. - получение ссылок на файлы или lnk * - для всех файлов.\n"
             "priv - сделать архив приватным (создать index.html).\n"
             "pub - сделать архив публичным (удалить index.html).\n"
             "ping - проверить доступность бота.\n"
@@ -520,11 +517,11 @@ class OBBFastBot(ClientXMPP):
         if is_admin:
             text += (
                 "\n\n🔧 Админ-команды:\n"
-                "add <jid|domain|*> - разрешить доступ (используйте * чтобы разрешить всем).\n"
+                "add <jid|domain|*> - разрешить доступ.\n"
                 "del <jid|domain|*> - запретить доступ.\n"
-                "block <jid|domain> - добавить в чёрный список.\n"
+                "block <jid|domain> - в чёрный список.\n"
                 "unblock <jid|domain> - убрать из чёрного списка.\n"
-                "list - показать белый список."
+                "list - показать белый и чёрный списки."
             )
         return text
 
@@ -532,38 +529,28 @@ class OBBFastBot(ClientXMPP):
     def handle_presence_subscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"🆕 Запрос подписки от {jid}")
-
-        # Уведомляем администратора
         notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
         if ADMIN_JID and notify_level == 'all':
             self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку", mtype='chat')
-
-        # Автоматически подтверждаем подписку
         self.send_presence(pto=jid, ptype='subscribed')
-        # И подписываемся в ответ
         self.send_presence(pto=jid, ptype='subscribe')
-
-        # Приветственное сообщение
         is_admin = ADMIN_JID and jid == ADMIN_JID.lower()
         _, user_hash = self.get_user_info(presence['from'])
         welcome_msg = f"Добро пожаловать!\nЯ бот для быстрой передачи файлов.\n\n{self.get_help_text(is_admin, user_hash)}"
         self.send_message(mto=jid, mbody=welcome_msg, mtype='chat')
 
-    # Обработчик подтверждения подписки
     def handle_presence_subscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"✅ Подписка подтверждена от {jid}")
         if ADMIN_JID:
             self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку", mtype='chat')
 
-    # Обработчик запроса на отмену подписки
     def handle_presence_unsubscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"➖ Запрос отписки от {jid}")
         if ADMIN_JID:
             self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов", mtype='chat')
 
-    # Обработчик подтверждения отмены подписки
     def handle_presence_unsubscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"❌ Подписка отменена от {jid}")
@@ -572,11 +559,9 @@ class OBBFastBot(ClientXMPP):
 
     # Обработчик обычных текстовых сообщений
     def handle_message(self, msg):
-        # Обрабатываем только личные сообщения с текстом
         if msg['type'] not in ('chat', 'normal') or not msg['body']:
             return
 
-        # Проверка разрешений
         if not self.is_allowed(msg['from']):
             logging.info(f"ACCESS DENIED (msg) from {msg['from']}")
             notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
@@ -587,20 +572,16 @@ class OBBFastBot(ClientXMPP):
                               mtype='chat')
             return
 
-        # Разбиваем сообщение на части
         parts = msg['body'].strip().split()
         if not parts:
             return
         cmd = parts[0].lower()
-
-        # Получаем папку и хеш пользователя
         user_dir, user_hash = self.get_user_info(msg['from'])
 
-        # Вспомогательная функция для ответов с новой строки
         def reply(text):
             self.send_message(mto=msg['from'], mbody=text, mtype='chat')
 
-        # Команда помощи
+        # Команды
         if cmd in ('help', '?'):
             if len(parts) != 1: return
             is_admin = ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower()
@@ -608,7 +589,6 @@ class OBBFastBot(ClientXMPP):
             help_text = self.get_help_text(is_admin, user_hash) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
             reply(help_text)
 
-        # Команда пинга
         elif cmd == 'ping':
             if len(parts) != 1: return
             reply("pong")
@@ -618,8 +598,9 @@ class OBBFastBot(ClientXMPP):
             target = self.get_safe_path(user_dir, parts[1])
             if target:
                 rel = os.path.relpath(target, user_dir)
-                if rel.count(os.sep) >= MAX_DIR_DEPTH:
-                    return reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
+                max_depth = int(os.getenv('MAX_DIR_DEPTH', 2))
+                if rel != "." and rel.count(os.sep) >= max_depth:
+                    return reply(f"❌ Ошибка: Максимальная глубина вложенности — {max_depth} уровня")
                 try:
                     os.makedirs(target, exist_ok=True)
                     reply(f"📁 Директория создана: {rel}")
@@ -656,6 +637,8 @@ class OBBFastBot(ClientXMPP):
             if not resolved_srcs:
                 return reply("❌ Объекты для перемещения не найдены")
 
+            max_depth = int(os.getenv('MAX_DIR_DEPTH', 2))
+
             if len(resolved_srcs) > 1:
                 if not os.path.isdir(dst):
                     return reply("❌ При перемещении нескольких объектов назначение должно быть директорией")
@@ -664,8 +647,13 @@ class OBBFastBot(ClientXMPP):
                 for src in resolved_srcs:
                     if os.path.abspath(src) == os.path.abspath(dst):
                         continue
+
+                    new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                    rel_dst = os.path.relpath(new_dst, user_dir)
+                    if rel_dst != "." and rel_dst.count(os.sep) >= max_depth:
+                         continue
+
                     try:
-                        new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
                         new_dst = self.get_unique_path(new_dst)
                         os.rename(src, new_dst)
                         moved_count += 1
@@ -676,18 +664,23 @@ class OBBFastBot(ClientXMPP):
                 src = resolved_srcs[0]
                 if src and os.path.exists(src):
                     try:
+                        # Если цель - директория, помещаем внутрь
+                        final_dst = dst
                         if os.path.isdir(dst):
-                             dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                             final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
 
-                        dst = self.get_unique_path(dst)
-                        os.rename(src, dst)
-                        reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(dst, user_dir)}")
+                        rel_dst = os.path.relpath(final_dst, user_dir)
+                        if rel_dst != "." and rel_dst.count(os.sep) >= max_depth:
+                             return reply(f"❌ Ошибка: Максимальная глубина вложенности — {max_depth} уровня")
+
+                        final_dst = self.get_unique_path(final_dst)
+                        os.rename(src, final_dst)
+                        reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(final_dst, user_dir)}")
                     except Exception as e:
                         reply(f"❌ Ошибка: {e}")
                 else:
                     reply("❌ Файл не найден")
 
-        # Команда показа списка файлов
         elif cmd == 'ls':
             if len(parts) > 2: return
             items = self.get_all_items(user_dir)
@@ -728,13 +721,11 @@ class OBBFastBot(ClientXMPP):
                     size = self.format_size(st.st_size)
                     mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
                     if itm.endswith('/'):
-                        res.append(f"{i+1} - {display_itm} (директория, {mtime})")
+                        res.append(f"{display_itm} (директория, {mtime})")
                     else:
-                        res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
-
+                        res.append(f"{display_itm} ({size}, загружен {mtime})")
             reply("\n".join(res))
 
-        # Команда получения ссылки на файл
         elif cmd in ('link', 'lnk'):
             if len(parts) != 2: return
             items = self.get_all_items(user_dir)
@@ -753,14 +744,11 @@ class OBBFastBot(ClientXMPP):
                 for path in resolved_paths:
                     if not os.path.isdir(path):
                         rel = os.path.relpath(path, user_dir)
-                        # Находим индекс для отображения
                         try: idx = items.index(rel if not os.path.isdir(path) else rel + "/")
                         except ValueError: idx = -1
                         res.append(f"{idx+1 if idx >=0 else '?'} - {self.base_url}/{user_hash}/{self.safe_quote(rel)}")
-                if res:
-                    reply("\n".join(res))
+                if res: reply("\n".join(res))
 
-        # Команда удаления файлов
         elif cmd == 'rm':
             if not (2 <= len(parts) <= 3): return
             items = self.get_all_items(user_dir)
@@ -769,17 +757,13 @@ class OBBFastBot(ClientXMPP):
 
             if parts[1] == '*':
                 if len(parts) == 3 and parts[2].lower() == 'confirm':
-                    # Удаляем всё содержимое user_dir
                     top_items = os.listdir(user_dir)
                     for item in top_items:
                         item_path = os.path.join(user_dir, item)
                         try:
-                            if os.path.isdir(item_path):
-                                shutil.rmtree(item_path)
-                            else:
-                                os.remove(item_path)
-                        except Exception:
-                            pass
+                            if os.path.isdir(item_path): shutil.rmtree(item_path)
+                            else: os.remove(item_path)
+                        except Exception: pass
                     reply("🗑 Все файлы и папки удалены.")
                 else:
                     reply("⚠ Чтобы удалить ВСЕ файлы, напишите: rm * confirm")
@@ -789,52 +773,40 @@ class OBBFastBot(ClientXMPP):
                 removed_count = 0
                 for path in resolved_paths:
                     try:
-                        if os.path.isdir(path):
-                            shutil.rmtree(path)
-                        else:
-                            os.remove(path)
+                        if os.path.isdir(path): shutil.rmtree(path)
+                        else: os.remove(path)
                         removed_count += 1
-                    except Exception:
-                        pass
-                if removed_count:
-                    reply(f"🗑 Удалено объектов: {removed_count}")
+                    except Exception: pass
+                if removed_count: reply(f"🗑 Удалено объектов: {removed_count}")
 
-        # Дополнительные команды пользователя
         elif cmd == 'priv':
             index_path = os.path.join(user_dir, 'index.html')
             if not os.path.exists(index_path):
                 with open(index_path, 'w') as f:
                     f.write("<html><body><h1>Private Archive</h1></body></html>")
                 reply("🔒 Архив теперь приватный (создан index.html)")
-            else:
-                reply("ℹ Архив уже приватный.")
+            else: reply("ℹ Архив уже приватный.")
 
         elif cmd == 'pub':
             index_path = os.path.join(user_dir, 'index.html')
             if os.path.exists(index_path):
                 os.remove(index_path)
                 reply("🔓 Архив теперь публичный (удалён index.html)")
-            else:
-                reply("ℹ Архив уже публичный.")
+            else: reply("ℹ Архив уже публичный.")
 
-        # Админ-команды для управления списками
+        # Админ-команды
         if ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower():
             if cmd == 'add' and len(parts) == 2:
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
                 added = []
                 for entry in entries:
-                    # Валидация: * или user@domain или domain
                     if entry == '*' or '@' in entry or '.' in entry:
                         self.db.add_to_whitelist(entry)
                         added.append(entry)
-
                 if added:
-                    if '*' in added:
-                        reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
-                    else:
-                        reply(f"➕ Добавлено в белый список: {', '.join(added)}")
-                else:
-                    reply("⚠ Неверный формат. Используйте user@domain, domain или *")
+                    if '*' in added: reply("🌟 Доступ разрешён для ВСЕХ пользователей.")
+                    else: reply(f"➕ Добавлено в белый список: {', '.join(added)}")
+                else: reply("⚠ Неверный формат. Используйте user@domain, domain или *")
 
             elif cmd == 'del' and len(parts) == 2:
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
@@ -844,11 +816,8 @@ class OBBFastBot(ClientXMPP):
                     if entry in whitelist:
                         self.db.remove_from_whitelist(entry)
                         removed.append(entry)
-
-                if removed:
-                    reply(f"➖ Удалено из белого списка: {', '.join(removed)}")
-                else:
-                    reply("❓ Ничего не найдено для удаления из белого списка.")
+                if removed: reply(f"➖ Удалено из белого списка: {', '.join(removed)}")
+                else: reply("❓ Ничего не найдено для удаления из белого списка.")
 
             elif cmd == 'block' and len(parts) == 2:
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
@@ -857,10 +826,8 @@ class OBBFastBot(ClientXMPP):
                     if '@' in entry or '.' in entry:
                         self.db.add_to_blacklist(entry)
                         added.append(entry)
-                if added:
-                    reply(f"🚫 Добавлено в чёрный список: {', '.join(added)}")
-                else:
-                    reply("⚠ Неверный формат. Используйте user@domain или domain")
+                if added: reply(f"🚫 Добавлено в чёрный список: {', '.join(added)}")
+                else: reply("⚠ Неверный формат. Используйте user@domain или domain")
 
             elif cmd == 'unblock' and len(parts) == 2:
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
@@ -870,10 +837,8 @@ class OBBFastBot(ClientXMPP):
                     if entry in blacklist:
                         self.db.remove_from_blacklist(entry)
                         removed.append(entry)
-                if removed:
-                    reply(f"✅ Удалено из чёрного списка: {', '.join(removed)}")
-                else:
-                    reply("❓ Ничего не найдено для удаления из чёрного списка.")
+                if removed: reply(f"✅ Удалено из чёрного списка: {', '.join(removed)}")
+                else: reply("❓ Ничего не найдено для удаления из чёрного списка.")
 
             elif cmd == 'list' and len(parts) == 1:
                 whitelist = self.db.get_whitelist()
@@ -882,222 +847,104 @@ class OBBFastBot(ClientXMPP):
                 res_b = "\n".join(sorted(blacklist))
                 reply(f"📄 Белый список:\n{res_w or '(пусто)'}\n\n🚫 Чёрный список:\n{res_b or '(пусто)'}")
 
-    # Обработчик входящего SI (Stream Initiation) запроса на передачу файла
+    # SI handler
     def handle_raw_si(self, iq):
-        # Проверка разрешений
         if not self.is_allowed(iq['from']):
             logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
             notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
             if ADMIN_JID and notify_level == 'all':
                 self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}", mtype='chat')
-            self.send_message(mto=iq['from'],
-                              mbody=f"У вас нет прав для пользования ботом. Обратитесь к {ADMIN_JID}",
-                              mtype='chat')
-            reply = iq.reply()
-            reply['type'] = 'error'
-            return reply.send()
+            self.send_message(mto=iq['from'], mbody=f"У вас нет прав для пользования ботом. Обратитесь к {ADMIN_JID}", mtype='chat')
+            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
 
         try:
-            # Находим элемент <si>
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
-
-            # ID сессии передачи и элемент <file>
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
-
-            # Имя и размер файла, который хочет отправить собеседник
-            # Санитизируем имя файла для предотвращения Path Traversal
-            # Заменяем пробелы на подчёркивания
             fname = os.path.basename(tag.get('name')).replace(' ', '_')
             fsize = int(tag.get('size', 0))
             logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
-
             user_dir, _ = self.get_user_info(iq['from'])
-
-            # Проверяем, хватит ли места в квоте
             if self.get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 logging.info(f"QUOTA EXCEEDED for {iq['from']}")
                 self.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
-                reply = iq.reply()
-                reply['type'] = 'error'
-                return reply.send()
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
 
-            # Запоминаем информацию о файле, который сейчас будут передавать
-            self.pending_files[sid] = {
-                'name': fname,
-                'size': fsize,
-                'timestamp': asyncio.get_event_loop().time()
-            }
-
-            # Формируем ответ: соглашаемся на SOCKS5
+            self.pending_files[sid] = {'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time()}
             reply = iq.reply()
             res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
             ET.SubElement(field, '{jabber:x:data}value').text = 'http://jabber.org/protocol/bytestreams'
+            reply.append(res_si); reply.send()
+        except Exception as e: logging.error(f"SI ERROR: {e}")
 
-            reply.append(res_si)
-            reply.send()
-
-        except Exception as e:
-            logging.error(f"SI ERROR: {e}")
-            # Если что-то сломалось — молча игнорируем (не отвечаем)
-            pass
-
-    # Обработчик входящего запроса SOCKS5 Bytestreams
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}")
-        # Запускаем асинхронную задачу обработки SOCKS5
         asyncio.create_task(self._manual_socks5_connect(iq))
 
-    # Обработчик XMPP Ping
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")
         reply = iq.reply()
-        # Добавляем элемент <ping xmlns="urn:xmpp:ping"/> в ответ
         ping = ET.Element('{urn:xmpp:ping}ping')
-        reply.append(ping)
-        reply.send()
+        reply.append(ping); reply.send()
         logging.info(f"PONG SENT to {iq['from']}")
 
-    # Асинхронная функция подключения по SOCKS5 и приёма файла
     async def _manual_socks5_connect(self, iq):
         sid = None
         try:
             query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
-            if query is None:
-                logging.error(f"SOCKS5: Query element not found in IQ: {iq}")
-                return
+            if query is None: return
             sid = query.get('sid')
             file_info = self.pending_files.get(sid)
-
-            if not file_info:
-                logging.warning(f"SOCKS5: Unknown SID {sid}")
-                return
-
-            # Вычисляем адрес SOCKS5 в соответствии со спецификацией
-            dst_addr = hashlib.sha1(
-                f"{sid}{iq['from'].full}{self.boundjid.full}".encode()
-            ).hexdigest()
-            logging.info(f"SOCKS5: Calculated dst_addr={dst_addr} for sid={sid}")
-
-            # Пробуем каждый предложенный streamhost по очереди
+            if not file_info: return
+            dst_addr = hashlib.sha1(f"{sid}{iq['from'].full}{self.boundjid.full}".encode()).hexdigest()
             hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
-            logging.info(f"SOCKS5: Found {len(hosts)} streamhosts")
             for host in hosts:
                 h_host, h_port, h_jid = host.get('host'), int(host.get('port', 1080)), host.get('jid')
-                logging.info(f"SOCKS5: Trying host {h_host}:{h_port} ({h_jid})")
                 try:
-                    # Устанавливаем TCP-соединение
-                    logging.info(f"SOCKS5: Opening connection to {h_host}:{h_port}")
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection(h_host, h_port),
-                        5
-                    )
-                    logging.info(f"SOCKS5: TCP connected to {h_host}:{h_port}")
-
-                    # SOCKS5 handshake: без аутентификации
-                    writer.write(b"\x05\x01\x00")
-                    await writer.drain()
-
-                    handshake_resp = await reader.read(2)
-                    if handshake_resp != b"\x05\x00":
-                        logging.warning(f"SOCKS5: Handshake failed for {h_host}: {handshake_resp}")
-                        writer.close()
-                        continue
-
-                    # Запрос на соединение с вычисленным адресом
-                    writer.write(b"\x05\x01\x00\x03" + bytes([len(dst_addr)]) + dst_addr.encode() + b"\x00\x00")
-                    await writer.drain()
-
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(h_host, h_port), 5)
+                    writer.write(b"\x05\x01\x00"); await writer.drain()
+                    if await reader.read(2) != b"\x05\x00": writer.close(); continue
+                    writer.write(b"\x05\x01\x00\x03" + bytes([len(dst_addr)]) + dst_addr.encode() + b"\x00\x00"); await writer.drain()
                     resp = await reader.read(4)
-                    if not resp or resp[1] != 0x00:
-                        logging.warning(f"SOCKS5: Connection request failed for {h_host}: {resp}")
-                        writer.close()
-                        continue
-
-                    # Пропускаем остаток ответа в зависимости от типа адреса
+                    if not resp or resp[1] != 0x00: writer.close(); continue
                     atyp = resp[3]
-                    if atyp == 0x01:    await reader.read(6)
-                    elif atyp == 0x03:  addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
-                    elif atyp == 0x04:  await reader.read(18)
-
-                    # Отвечаем, что используем именно этот streamhost
-                    logging.info(f"SOCKS5: Connected to {h_host}, sending streamhost-used")
+                    if atyp == 0x01: await reader.read(6)
+                    elif atyp == 0x03: addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
+                    elif atyp == 0x04: await reader.read(18)
                     reply = iq.reply()
                     res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
                     ET.SubElement(res_q, 'streamhost-used', jid=h_jid)
-                    reply.append(res_q)
-                    reply.send()
-
-                    # Запускаем приём файла
+                    reply.append(res_q); reply.send()
                     await self.download_file_task(reader, file_info, iq['from'])
-
-                    writer.close()
-                    await writer.wait_closed()
-                    return
-
-                except asyncio.TimeoutError:
-                    logging.warning(f"SOCKS5: Timeout connecting to {h_host}:{h_port}")
-                    continue
-                except Exception as e:
-                    logging.warning(f"SOCKS5: Error with host {h_host}: {e}")
-                    continue
-
-            # Если ни один прокси не сработал — ошибка
-            logging.error(f"SOCKS5: All streamhosts failed for sid={sid}")
-            reply = iq.reply()
-            reply['type'] = 'error'
-            reply.send()
-
-        except Exception as e:
-            logging.error(f"SOCKS5 ERROR: {e}")
+                    writer.close(); await writer.wait_closed(); return
+                except Exception: continue
+            reply = iq.reply(); reply['type'] = 'error'; reply.send()
+        except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
         finally:
-            if sid in self.pending_files:
-                del self.pending_files[sid]
+            if sid in self.pending_files: del self.pending_files[sid]
 
-    # Асинхронная функция непосредственного приёма данных файла
     async def download_file_task(self, reader, file_info, peer_jid):
         user_dir, user_hash = self.get_user_info(peer_jid)
-        # Санитизируем имя файла ещё раз при формировании пути
         fname = os.path.basename(file_info['name'])
         path = os.path.join(user_dir, fname)
         received = 0
-        logging.info(f"DOWNLOAD START: {file_info['name']} to {path}")
-
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    # Читаем кусок до 1 МБ
                     chunk = await reader.read(min(file_info['size'] - received, 1048576))
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    received += len(chunk)
-
-                f.flush()
-                os.fsync(f.fileno())
-
-            # Если всё получили полностью — сообщаем пользователю ссылку
+                    if not chunk: break
+                    f.write(chunk); received += len(chunk)
+                f.flush(); os.fsync(f.fileno())
             if received == file_info['size']:
-                logging.info(f"DOWNLOAD COMPLETE: {file_info['name']}, {received} bytes")
                 safe_name = self.safe_quote(file_info['name'])
-                self.send_message(
-                    mto=peer_jid,
-                    mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_name}",
-                    mtype='chat'
-                )
+                self.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_name}", mtype='chat')
             else:
-                # Если файл не докачан — удаляем его, чтобы не занимал квоту
-                logging.warning(f"DOWNLOAD INCOMPLETE: {file_info['name']}, got {received}/{file_info['size']}. Deleting.")
-                if os.path.exists(path):
-                    os.remove(path)
-
+                if os.path.exists(path): os.remove(path)
         except Exception as e:
-            # При любой ошибке удаляем файл
             logging.error(f"Ошибка при приёме файла: {e}")
-            if os.path.exists(path):
-                os.remove(path)
+            if os.path.exists(path): os.remove(path)
 
 
 # Точка входа — основная асинхронная функция
