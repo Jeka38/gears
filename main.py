@@ -64,6 +64,9 @@ WHITELIST_FILE = os.getenv('WHITELIST_FILE', 'whitelist.json')
 # Путь к базе данных
 DB_PATH = os.getenv('DB_PATH', '/app/data/bot.db')
 
+# Лимит вложенности директорий
+MAX_DIR_DEPTH = int(os.getenv('MAX_DIR_DEPTH', 2))
+
 # Версия софта
 VERSION = os.getenv('APP_VERSION', '1.1')
 
@@ -371,6 +374,23 @@ class OBBFastBot(ClientXMPP):
         super().send_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
 
     # Получаем (и при необходимости создаём) персональную папку пользователя
+    def get_unique_path(self, path):
+        if not os.path.exists(path):
+            return path
+
+        base, ext = os.path.splitext(path)
+        # Если путь - директория, ext будет пустым, base будет полным путем
+        if os.path.isdir(path) and not path.endswith('/'):
+             # Для директорий без расширения (обычно)
+             pass
+
+        counter = 1
+        while True:
+            new_path = f"{base}_{counter}{ext}"
+            if not os.path.exists(new_path):
+                return new_path
+            counter += 1
+
     def get_user_info(self, jid):
         bare_jid = jid.bare.lower()
         user_hash = self.db.get_user_folder(bare_jid)
@@ -421,18 +441,18 @@ class OBBFastBot(ClientXMPP):
             if rel_root == ".":
                 rel_root = ""
 
-            # Ограничение вложенности: не более 2 уровней директорий
-            if rel_root != "" and rel_root.count(os.sep) >= 2:
+            # Ограничение вложенности: не более MAX_DIR_DEPTH уровней директорий
+            if rel_root != "" and rel_root.count(os.sep) >= MAX_DIR_DEPTH:
                 continue
 
             for d in dirs:
                 path = os.path.join(rel_root, d)
-                if path.count(os.sep) < 2:
+                if path.count(os.sep) < MAX_DIR_DEPTH:
                     items.append(path + "/")
             for f in files:
                 path = os.path.join(rel_root, f)
-                # Файлы могут находиться в директориях 2-го уровня
-                if path.count(os.sep) <= 2:
+                # Файлы могут находиться в директориях уровня MAX_DIR_DEPTH
+                if path.count(os.sep) <= MAX_DIR_DEPTH:
                     items.append(path)
         return sorted(items)
 
@@ -598,8 +618,8 @@ class OBBFastBot(ClientXMPP):
             target = self.get_safe_path(user_dir, parts[1])
             if target:
                 rel = os.path.relpath(target, user_dir)
-                if rel.count(os.sep) >= 2:
-                    return reply("❌ Ошибка: Максимальная глубина вложенности — 2 уровня")
+                if rel.count(os.sep) >= MAX_DIR_DEPTH:
+                    return reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
                 try:
                     os.makedirs(target, exist_ok=True)
                     reply(f"📁 Директория создана: {rel}")
@@ -645,7 +665,9 @@ class OBBFastBot(ClientXMPP):
                     if os.path.abspath(src) == os.path.abspath(dst):
                         continue
                     try:
-                        os.rename(src, os.path.join(dst, os.path.basename(src.rstrip('/'))))
+                        new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                        new_dst = self.get_unique_path(new_dst)
+                        os.rename(src, new_dst)
                         moved_count += 1
                     except Exception:
                         pass
@@ -656,6 +678,8 @@ class OBBFastBot(ClientXMPP):
                     try:
                         if os.path.isdir(dst):
                              dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+
+                        dst = self.get_unique_path(dst)
                         os.rename(src, dst)
                         reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(dst, user_dir)}")
                     except Exception as e:
