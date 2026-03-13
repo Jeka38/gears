@@ -16,6 +16,9 @@ import hashlib
 # Импорт модуля для работы с форматом JSON
 import json
 
+# Импорт модуля для поиска файлов по шаблонам (wildcards)
+import fnmatch
+
 # Импорт модуля для работы с SQLite
 import sqlite3
 
@@ -444,6 +447,21 @@ class OBBFastBot(ClientXMPP):
         # Иначе трактуем как относительный путь
         return self.get_safe_path(user_dir, arg)
 
+    def resolve_items_list(self, user_dir, arg, items):
+        resolved = []
+        parts = [p.strip() for p in arg.split(',') if p.strip()]
+        for p in parts:
+            if '*' in p or '?' in p:
+                matches = fnmatch.filter(items, p)
+                for m in matches:
+                    path = self.get_safe_path(user_dir, m)
+                    if path: resolved.append(path)
+            else:
+                path = self.resolve_item(user_dir, p, items)
+                if path: resolved.append(path)
+        # Удаляем дубликаты, сохраняя порядок
+        return list(dict.fromkeys(resolved))
+
     def get_help_text(self, is_admin=False, user_hash=None):
         text = (
             "команды:\n"
@@ -574,42 +592,48 @@ class OBBFastBot(ClientXMPP):
         elif cmd == 'rmdir':
             if len(parts) != 2: return
             items = self.get_all_items(user_dir)
-            target = self.resolve_item(user_dir, parts[1], items)
-            if target and os.path.isdir(target):
-                try:
-                    os.rmdir(target)
-                    reply(f"🗑 Директория удалена: {os.path.relpath(target, user_dir)}")
-                except OSError:
-                    reply("❌ Ошибка: Директория не пуста или не существует")
-                except Exception as e:
-                    reply(f"❌ Ошибка: {e}")
+            resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
+            removed_count = 0
+            for target in resolved_paths:
+                if target and os.path.isdir(target):
+                    try:
+                        os.rmdir(target)
+                        removed_count += 1
+                    except Exception:
+                        pass
+            if removed_count:
+                reply(f"🗑 Удалено директорий: {removed_count}")
             else:
-                reply("❌ Директория не найдена")
+                reply("❌ Директории не найдены или не пусты")
 
         elif cmd == 'mv':
             if len(parts) != 3: return
             items = self.get_all_items(user_dir)
-            if parts[1] == '*':
-                dst = self.resolve_item(user_dir, parts[2], items)
-                if dst and os.path.isdir(dst):
-                    top_items = os.listdir(user_dir)
-                    moved_count = 0
-                    for item in top_items:
-                        src_path = os.path.join(user_dir, item)
-                        if os.path.abspath(src_path) == os.path.abspath(dst):
-                            continue
-                        try:
-                            os.rename(src_path, os.path.join(dst, item))
-                            moved_count += 1
-                        except Exception:
-                            pass
-                    reply(f"🚚 Перемещено объектов: {moved_count}")
-                else:
-                    reply("❌ Путь назначения должен быть директорией")
+            dst = self.resolve_item(user_dir, parts[2], items)
+            if not dst:
+                return reply("❌ Недопустимый путь назначения")
+
+            resolved_srcs = self.resolve_items_list(user_dir, parts[1], items)
+            if not resolved_srcs:
+                return reply("❌ Объекты для перемещения не найдены")
+
+            if len(resolved_srcs) > 1:
+                if not os.path.isdir(dst):
+                    return reply("❌ При перемещении нескольких объектов назначение должно быть директорией")
+
+                moved_count = 0
+                for src in resolved_srcs:
+                    if os.path.abspath(src) == os.path.abspath(dst):
+                        continue
+                    try:
+                        os.rename(src, os.path.join(dst, os.path.basename(src.rstrip('/'))))
+                        moved_count += 1
+                    except Exception:
+                        pass
+                reply(f"🚚 Перемещено объектов: {moved_count}")
             else:
-                src = self.resolve_item(user_dir, parts[1], items)
-                dst = self.resolve_item(user_dir, parts[2], items)
-                if src and dst and os.path.exists(src):
+                src = resolved_srcs[0]
+                if src and os.path.exists(src):
                     try:
                         if os.path.isdir(dst):
                              dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
@@ -618,7 +642,7 @@ class OBBFastBot(ClientXMPP):
                     except Exception as e:
                         reply(f"❌ Ошибка: {e}")
                 else:
-                    reply("❌ Ошибка в путях или файл не найден")
+                    reply("❌ Файл не найден")
 
         # Команда показа списка файлов
         elif cmd == 'ls':
@@ -640,7 +664,7 @@ class OBBFastBot(ClientXMPP):
                     reply("\n".join(res))
                 elif parts[1] == '-l':
                     res = []
-                    for i, itm in enumerate(items):
+                    for itm in items:
                         full_path = os.path.join(user_dir, itm)
                         st = os.stat(full_path)
                         # Размер
@@ -648,9 +672,9 @@ class OBBFastBot(ClientXMPP):
                         # Дата загрузки/изменения
                         mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
                         if itm.endswith('/'):
-                            res.append(f"{i+1} - {itm} (директория, {mtime})")
+                            res.append(f"{itm} (директория, {mtime})")
                         else:
-                            res.append(f"{i+1} - {itm} ({size}, загружен {mtime})")
+                            res.append(f"{itm} ({size}, загружен {mtime})")
                     reply("\n".join(res))
                 return
 
@@ -677,16 +701,15 @@ class OBBFastBot(ClientXMPP):
                         res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
                 reply("\n".join(res))
             else:
-                try:
-                    indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())))
-                except ValueError: return
-
+                resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
                 res = []
-                for idx in indices:
-                    if 0 <= idx < len(items):
-                        itm = items[idx]
-                        if not itm.endswith('/'):
-                            res.append(f"{idx+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
+                for path in resolved_paths:
+                    if not os.path.isdir(path):
+                        rel = os.path.relpath(path, user_dir)
+                        # Находим индекс для отображения
+                        try: idx = items.index(rel if not os.path.isdir(path) else rel + "/")
+                        except ValueError: idx = -1
+                        res.append(f"{idx+1 if idx >=0 else '?'} - {self.base_url}/{user_hash}/{self.safe_quote(rel)}")
                 if res:
                     reply("\n".join(res))
 
@@ -715,23 +738,17 @@ class OBBFastBot(ClientXMPP):
                     reply("⚠ Чтобы удалить ВСЕ файлы, напишите: rm * confirm")
             else:
                 if len(parts) != 2: return
-                try:
-                    indices = sorted(list(set(int(p.strip()) - 1 for p in parts[1].split(',') if p.strip())), reverse=True)
-                except ValueError: return
-
+                resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
                 removed_count = 0
-                for idx in indices:
-                    if 0 <= idx < len(items):
-                        itm = items[idx]
-                        path = os.path.join(user_dir, itm)
-                        try:
-                            if os.path.isdir(path):
-                                shutil.rmtree(path)
-                            else:
-                                os.remove(path)
-                            removed_count += 1
-                        except OSError:
-                            pass
+                for path in resolved_paths:
+                    try:
+                        if os.path.isdir(path):
+                            shutil.rmtree(path)
+                        else:
+                            os.remove(path)
+                        removed_count += 1
+                    except Exception:
+                        pass
                 if removed_count:
                     reply(f"🗑 Удалено объектов: {removed_count}")
 
