@@ -682,11 +682,7 @@ class OBBFastBot(ClientXMPP):
                 full_path = os.path.join(user_dir, itm)
 
                 if mode == 'links':
-                    if itm.endswith('/'):
-                        res.append(f"{i+1} - {display_itm}")
-                    else:
-                        url = f"{self.base_url}/{user_hash}/{self.safe_quote(itm)}"
-                        res.append(f"{i+1} - {display_itm} - {url}")
+                    res.append(f"{i+1} - {display_itm}")
                 elif mode == 'size':
                     if itm.endswith('/'):
                         res.append(f"{i+1} - {display_itm} [директория]")
