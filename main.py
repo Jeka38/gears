@@ -402,15 +402,14 @@ class OBBFastBot(ClientXMPP):
         return sum(os.path.getsize(os.path.join(d, f))
                    for d, _, fs in os.walk(path) for f in fs)
 
-    # Форматируем размер в человеко-читаемый вид (B → kB → MB → GB)
+    # Форматируем размер в человеко-читаемый вид (Б → кБ → МБ → ГБ)
     def format_size(self, size):
-        for unit in ['B', 'kB', 'MB', 'GB']:
+        for unit in ['Б', 'кБ', 'МБ', 'ГБ']:
             if size < 1024:
-                if unit == 'B':
-                    return f"{int(size)}{unit}"
-                return f"{size:.1f}{unit}"
+                res = f"{size:.1f}".replace('.', ',')
+                return f"{res} {unit}"
             size /= 1024
-        return f"{size:.1f}GB"
+        return f"{size:.1f} ГБ".replace('.', ',')
 
     def get_all_items(self, user_dir):
         items = []
@@ -644,13 +643,14 @@ class OBBFastBot(ClientXMPP):
                     for i, itm in enumerate(items):
                         full_path = os.path.join(user_dir, itm)
                         st = os.stat(full_path)
-                        # Формат разрешений
-                        perms = stat.filemode(st.st_mode)
                         # Размер
                         size = self.format_size(st.st_size)
                         # Дата загрузки/изменения
                         mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
-                        res.append(f"{i+1} - {perms} {size:>8} {mtime} {itm}")
+                        if itm.endswith('/'):
+                            res.append(f"{i+1} - {itm} (директория, {mtime})")
+                        else:
+                            res.append(f"{i+1} - {itm} ({size}, загружен {mtime})")
                     reply("\n".join(res))
                 return
 
