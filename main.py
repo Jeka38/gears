@@ -597,9 +597,12 @@ class OBBFastBot(ClientXMPP):
             if len(parts) != 2: return
             target = self.get_safe_path(user_dir, parts[1])
             if target:
+                rel = os.path.relpath(target, user_dir)
+                if rel.count(os.sep) >= 2:
+                    return reply("❌ Ошибка: Максимальная глубина вложенности — 2 уровня")
                 try:
                     os.makedirs(target, exist_ok=True)
-                    reply(f"📁 Директория создана: {os.path.relpath(target, user_dir)}")
+                    reply(f"📁 Директория создана: {rel}")
                 except Exception as e:
                     reply(f"❌ Ошибка: {e}")
             else:
