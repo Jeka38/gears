@@ -369,8 +369,6 @@ class OBBFastBot(ClientXMPP):
 
     def send_message(self, mto, mbody, msubject=None, mtype=None, mhtml=None,
                      mfrom=None, mnick=None):
-        if mbody and not mbody.startswith('\n'):
-            mbody = '\n' + mbody
         super().send_message(mto, mbody, msubject, mtype, mhtml, mfrom, mnick)
 
     # Получаем уникальный путь для предотвращения перезаписи
@@ -433,25 +431,23 @@ class OBBFastBot(ClientXMPP):
     # Получаем все элементы рекурсивно с ограничением вложенности
     def get_all_items(self, user_dir):
         items = []
-        # Динамически получаем лимит из окружения
-        max_depth = int(os.getenv('MAX_DIR_DEPTH', 2))
         for root, dirs, files in os.walk(user_dir):
             rel_root = os.path.relpath(root, user_dir)
             if rel_root == ".":
                 rel_root = ""
 
             # Ограничение вложенности: не более MAX_DIR_DEPTH уровней директорий
-            if rel_root != "" and rel_root.count(os.sep) >= max_depth:
+            if rel_root != "" and rel_root.count(os.sep) >= MAX_DIR_DEPTH:
                 continue
 
             for d in dirs:
                 path = os.path.join(rel_root, d)
-                if path.count(os.sep) < max_depth:
+                if path.count(os.sep) < MAX_DIR_DEPTH:
                     items.append(path + "/")
             for f in files:
                 path = os.path.join(rel_root, f)
                 # Файлы могут находиться в директориях уровня MAX_DIR_DEPTH
-                if path.count(os.sep) <= max_depth:
+                if path.count(os.sep) <= MAX_DIR_DEPTH:
                     items.append(path)
         return sorted(items)
 
@@ -499,7 +495,7 @@ class OBBFastBot(ClientXMPP):
         text = (
             "команды:\n"
             "ls - список файлов и каталогов в папке пользователя.\n"
-            "ls <-s|-l> - список файлов (-s: размер, -l: подробно). Пример: ls -l\n"
+            "ls <-s|-l>, lss, lsl - список файлов (-s: размер, -l: подробно). Пример: ls -l\n"
             "mkdir <путь> - создать директорию.\n"
             "rmdir <номер|путь> - удалить пустую директорию.\n"
             "mv <номер|путь> <номер|путь> - переместить/переименовать.\n"
@@ -598,9 +594,8 @@ class OBBFastBot(ClientXMPP):
             target = self.get_safe_path(user_dir, parts[1])
             if target:
                 rel = os.path.relpath(target, user_dir)
-                max_depth = int(os.getenv('MAX_DIR_DEPTH', 2))
-                if rel != "." and rel.count(os.sep) >= max_depth:
-                    return reply(f"❌ Ошибка: Максимальная глубина вложенности — {max_depth} уровня")
+                if rel != "." and rel.count(os.sep) >= MAX_DIR_DEPTH:
+                    return reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
                 try:
                     os.makedirs(target, exist_ok=True)
                     reply(f"📁 Директория создана: {rel}")
@@ -637,8 +632,6 @@ class OBBFastBot(ClientXMPP):
             if not resolved_srcs:
                 return reply("❌ Объекты для перемещения не найдены")
 
-            max_depth = int(os.getenv('MAX_DIR_DEPTH', 2))
-
             if len(resolved_srcs) > 1:
                 if not os.path.isdir(dst):
                     return reply("❌ При перемещении нескольких объектов назначение должно быть директорией")
@@ -650,7 +643,7 @@ class OBBFastBot(ClientXMPP):
 
                     new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
                     rel_dst = os.path.relpath(new_dst, user_dir)
-                    if rel_dst != "." and rel_dst.count(os.sep) >= max_depth:
+                    if rel_dst != "." and rel_dst.count(os.sep) >= MAX_DIR_DEPTH:
                          continue
 
                     try:
@@ -670,8 +663,8 @@ class OBBFastBot(ClientXMPP):
                              final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
 
                         rel_dst = os.path.relpath(final_dst, user_dir)
-                        if rel_dst != "." and rel_dst.count(os.sep) >= max_depth:
-                             return reply(f"❌ Ошибка: Максимальная глубина вложенности — {max_depth} уровня")
+                        if rel_dst != "." and rel_dst.count(os.sep) >= MAX_DIR_DEPTH:
+                             return reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
 
                         final_dst = self.get_unique_path(final_dst)
                         os.rename(src, final_dst)
@@ -681,14 +674,16 @@ class OBBFastBot(ClientXMPP):
                 else:
                     reply("❌ Файл не найден")
 
-        elif cmd == 'ls':
+        elif cmd in ('ls', 'lss', 'lsl'):
             if len(parts) > 2: return
             items = self.get_all_items(user_dir)
             if not items:
                 return reply("📁 Папка пуста")
 
             mode = 'links'
-            if len(parts) == 2:
+            if cmd == 'lss': mode = 'size'
+            elif cmd == 'lsl': mode = 'long'
+            elif len(parts) == 2:
                 if parts[1] == '-s': mode = 'size'
                 elif parts[1] == '-l': mode = 'long'
                 else: return
@@ -702,7 +697,7 @@ class OBBFastBot(ClientXMPP):
                 if itm.endswith('/'): name += "/"
 
                 if depth > 0:
-                    display_itm = "    " * (depth - 1) + "└── " + name
+                    display_itm = "    " * depth + "└── " + name
                 else:
                     display_itm = name
 
