@@ -538,20 +538,14 @@ class OBBFastBot(ClientXMPP):
     def handle_presence_subscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"✅ Подписка подтверждена от {jid}")
-        if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} подтвердил подписку", mtype='chat')
 
     def handle_presence_unsubscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"➖ Запрос отписки от {jid}")
-        if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов", mtype='chat')
 
     def handle_presence_unsubscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"❌ Подписка отменена от {jid}")
-        if ADMIN_JID:
-            self.send_message(mto=ADMIN_JID, mbody=f"❌ Пользователь {jid} отменил подписку", mtype='chat')
 
     # Обработчик обычных текстовых сообщений
     def handle_message(self, msg):
@@ -724,7 +718,7 @@ class OBBFastBot(ClientXMPP):
                         res.append(f"{i+1} - {display_itm} (директория, {mtime})")
                     else:
                         res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
-            reply("\n".join(res))
+            reply("\n" + "\n".join(res))
 
         elif cmd in ('link', 'lnk'):
             if len(parts) != 2: return
