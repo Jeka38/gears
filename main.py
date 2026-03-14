@@ -445,6 +445,8 @@ class OBBFastBot(ClientXMPP):
                 if path.count(os.sep) < MAX_DIR_DEPTH:
                     items.append(path + "/")
             for f in files:
+                if f == 'index.html':
+                    continue
                 path = os.path.join(rel_root, f)
                 # Файлы могут находиться в директориях уровня MAX_DIR_DEPTH
                 if path.count(os.sep) <= MAX_DIR_DEPTH:
