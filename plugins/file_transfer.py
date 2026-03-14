@@ -44,7 +44,9 @@ class FileTransferPlugin(BasePlugin):
                 if x_data is not None:
                     field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
                     if field is not None:
+                        # Extract from <value> and <option><value>
                         offered_methods = [v.text for v in field.findall('{jabber:x:data}value')]
+                        offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
 
             chosen_method = None
             if 'http://jabber.org/protocol/bytestreams' in offered_methods:
@@ -60,7 +62,8 @@ class FileTransferPlugin(BasePlugin):
                 'name': fname,
                 'size': fsize,
                 'timestamp': asyncio.get_event_loop().time(),
-                'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods
+                'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
+                'peer_jid': iq['from']
             }
 
             reply = iq.reply()
@@ -121,6 +124,12 @@ class FileTransferPlugin(BasePlugin):
         sid = stream.sid
         file_info = self.bot.pending_files.get(sid)
         if file_info:
+            # Verify JID match
+            if file_info['peer_jid'].bare != stream.peer_jid.bare:
+                logging.warning(f"JID mismatch for IBB stream {sid}: {file_info['peer_jid']} != {stream.peer_jid}")
+                stream.close()
+                return
+
             logging.info(f"IBB stream started for sid={sid}")
             asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
         else:
