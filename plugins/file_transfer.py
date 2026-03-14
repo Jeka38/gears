@@ -103,10 +103,14 @@ class FileTransferPlugin(BasePlugin):
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
 
-            # Extract transport SID (important for IBB)
+            # Extract transport SID (important for IBB and S5B)
             transport_sid = sid
             ibb_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
-            if ibb_t is not None and ibb_t.get('sid'):
+            s5b_t = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+
+            if s5b_t is not None and s5b_t.get('sid'):
+                transport_sid = s5b_t.get('sid')
+            elif ibb_t is not None and ibb_t.get('sid'):
                 transport_sid = ibb_t.get('sid')
 
             self.bot.pending_files[sid] = {
@@ -142,7 +146,7 @@ class FileTransferPlugin(BasePlugin):
 
                 if s5b_t is not None:
                     # Prefer SOCKS5 if offered
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
                 elif ibb_t is not None:
                     # Fallback to IBB if offered
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
@@ -154,6 +158,10 @@ class FileTransferPlugin(BasePlugin):
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
 
                 accept_iq.append(res_j); accept_iq.send()
+
+                # If SOCKS5 candidates were already provided, try to connect
+                if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
+                    asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
             except Exception as e: logging.error(f"Error sending session-accept: {e}")
 
         elif action == 'transport-info':
