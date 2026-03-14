@@ -67,7 +67,7 @@ class FileTransferPlugin(BasePlugin):
             if os.path.exists(path): os.remove(path)
 
     def handle_jingle(self, iq):
-        logging.info(f"JINGLE REQUEST from {iq['from']}")
+        logging.info(f"JINGLE REQUEST ({iq.xml.find('{urn:xmpp:jingle:1}jingle').get('action')}) from {iq['from']}")
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action = jingle.get('action')
@@ -79,13 +79,20 @@ class FileTransferPlugin(BasePlugin):
 
             content = jingle.find('{urn:xmpp:jingle:1}content')
             if content is None: return
-            description = content.find('{urn:xmpp:jingle:apps:file-transfer:5}description')
+
+            # Support both FT v4 and v5
+            ft_ns = 'urn:xmpp:jingle:apps:file-transfer:5'
+            description = content.find(f'{{{ft_ns}}}description')
+            if description is None:
+                ft_ns = 'urn:xmpp:jingle:apps:file-transfer:4'
+                description = content.find(f'{{{ft_ns}}}description')
+
             if description is None: return
-            file_tag = description.find('{urn:xmpp:jingle:apps:file-transfer:5}file')
+            file_tag = description.find(f'{{{ft_ns}}}file')
             if file_tag is None: return
 
-            name_tag = file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}name')
-            size_tag = file_tag.find('{urn:xmpp:jingle:apps:file-transfer:5}size')
+            name_tag = file_tag.find(f'{{{ft_ns}}}name')
+            size_tag = file_tag.find(f'{{{ft_ns}}}size')
             if name_tag is None or size_tag is None: return
 
             fname = os.path.basename(name_tag.text).replace(' ', '_')
@@ -96,6 +103,12 @@ class FileTransferPlugin(BasePlugin):
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
 
+            # Extract transport SID (important for IBB)
+            transport_sid = sid
+            ibb_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+            if ibb_t is not None and ibb_t.get('sid'):
+                transport_sid = ibb_t.get('sid')
+
             self.bot.pending_files[sid] = {
                 'name': fname,
                 'size': fsize,
@@ -103,33 +116,36 @@ class FileTransferPlugin(BasePlugin):
                 'peer_jid': iq['from'],
                 'ibb_allowed': True,
                 'content_name': content.get('name'),
-                'content_creator': content.get('creator')
+                'content_creator': content.get('creator'),
+                'ft_ns': ft_ns,
+                'transport_sid': transport_sid
             }
+            if transport_sid != sid:
+                self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
 
             reply = iq.reply(); reply.send()
 
             # Respond with session-accept
-            accept_iq = self.bot.make_iq_set(ito=iq['from'])
-            res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-accept', 'sid': sid, 'initiator': iq['from'].full})
-            res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': content.get('creator'), 'name': content.get('name')})
+            try:
+                accept_iq = self.bot.make_iq_set(ito=iq['from'])
+                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-accept', 'sid': sid, 'initiator': iq['from'].full})
+                res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': content.get('creator'), 'name': content.get('name')})
 
-            # XEP-0234 requires <file> in <description>
-            res_d = ET.SubElement(res_c, '{urn:xmpp:jingle:apps:file-transfer:5}description')
-            res_f = ET.SubElement(res_d, '{urn:xmpp:jingle:apps:file-transfer:5}file')
-            ET.SubElement(res_f, '{urn:xmpp:jingle:apps:file-transfer:5}name').text = fname
-            ET.SubElement(res_f, '{urn:xmpp:jingle:apps:file-transfer:5}size').text = str(fsize)
+                res_d = ET.SubElement(res_c, f'{{{ft_ns}}}description')
+                res_f = ET.SubElement(res_d, f'{{{ft_ns}}}file')
+                ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname
+                ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
 
-            # Prefer IBB for reliability
-            ibb_transport = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
-            if ibb_transport is not None:
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
-            else:
-                s5b_transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
-                if s5b_transport is not None:
-                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
+                if ibb_t is not None:
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
                 else:
-                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
-            accept_iq.append(res_j); accept_iq.send()
+                    s5b_t = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+                    if s5b_t is not None:
+                         ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
+                    else:
+                         ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+                accept_iq.append(res_j); accept_iq.send()
+            except Exception as e: logging.error(f"Error sending session-accept: {e}")
 
         elif action == 'transport-info':
             # Handle SOCKS5 candidates if they come
@@ -258,15 +274,17 @@ class FileTransferPlugin(BasePlugin):
 
                     if jingle_sid:
                         # Jingle transport-info candidate-used
-                        reply = self.bot.make_iq_set(ito=iq['from'])
-                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-info', 'sid': sid})
-                        res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
-                            'creator': file_info.get('content_creator', 'initiator'),
-                            'name': file_info.get('content_name', 'file')
-                        })
-                        res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid})
-                        ET.SubElement(res_t, 'candidate-used', cid=host.get('cid'))
-                        reply.append(res_j); reply.send()
+                        try:
+                            reply = self.bot.make_iq_set(ito=iq['from'])
+                            res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-info', 'sid': sid})
+                            res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
+                                'creator': file_info.get('content_creator', 'initiator'),
+                                'name': file_info.get('content_name', 'file')
+                            })
+                            res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid})
+                            ET.SubElement(res_t, 'candidate-used', cid=host.get('cid'))
+                            reply.append(res_j); reply.send()
+                        except Exception as e: logging.error(f"Error sending transport-info: {e}")
                     else:
                         reply = iq.reply()
                         res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
