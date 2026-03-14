@@ -643,7 +643,10 @@ class OBBFastBot(ClientXMPP):
 
                     new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
                     rel_dst = os.path.relpath(new_dst, user_dir)
-                    if rel_dst != "." and rel_dst.count(os.sep) >= MAX_DIR_DEPTH:
+
+                    is_dir = os.path.isdir(src)
+                    limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
+                    if rel_dst != "." and rel_dst.count(os.sep) > limit:
                          continue
 
                     try:
@@ -663,8 +666,10 @@ class OBBFastBot(ClientXMPP):
                              final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
 
                         rel_dst = os.path.relpath(final_dst, user_dir)
-                        if rel_dst != "." and rel_dst.count(os.sep) >= MAX_DIR_DEPTH:
-                             return reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
+                        is_dir = os.path.isdir(src)
+                        limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
+                        if rel_dst != "." and rel_dst.count(os.sep) > limit:
+                             return reply(f"❌ Ошибка: Превышена максимальная глубина вложенности")
 
                         final_dst = self.get_unique_path(final_dst)
                         os.rename(src, final_dst)
@@ -716,9 +721,9 @@ class OBBFastBot(ClientXMPP):
                     size = self.format_size(st.st_size)
                     mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
                     if itm.endswith('/'):
-                        res.append(f"{display_itm} (директория, {mtime})")
+                        res.append(f"{i+1} - {display_itm} (директория, {mtime})")
                     else:
-                        res.append(f"{display_itm} ({size}, загружен {mtime})")
+                        res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
             reply("\n".join(res))
 
         elif cmd in ('link', 'lnk'):
