@@ -22,9 +22,6 @@ import fnmatch
 # Импорт модуля для работы с SQLite
 import sqlite3
 
-# Импорт модуля для работы с правами доступа и типами файлов
-import stat
-
 # Импорт модуля для рекурсивного удаления директорий
 import shutil
 
@@ -527,6 +524,14 @@ class OBBFastBot(ClientXMPP):
     def handle_presence_subscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"🆕 Запрос подписки от {jid}")
+
+        if not self.is_allowed(presence['from']):
+            logging.info(f"ACCESS DENIED (subscribe) from {jid}")
+            self.send_message(mto=jid,
+                              mbody=f"⚠️ Доступ запрещён. Пожалуйста, обратитесь к администратору для получения доступа: {ADMIN_JID}",
+                              mtype='chat')
+            return
+
         self.send_presence(pto=jid, ptype='subscribed')
         self.send_presence(pto=jid, ptype='subscribe')
         is_admin = ADMIN_JID and jid == ADMIN_JID.lower()
@@ -561,7 +566,7 @@ class OBBFastBot(ClientXMPP):
             if ADMIN_JID and notify_level == 'all':
                 self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка сообщения от {msg['from']}", mtype='chat')
             self.send_message(mto=msg['from'],
-                              mbody=f"У вас нет прав для пользования ботом. Обратитесь к {ADMIN_JID}",
+                              mbody=f"⚠️ Доступ запрещён. Пожалуйста, обратитесь к администратору для получения доступа: {ADMIN_JID}",
                               mtype='chat')
             return
 
@@ -851,7 +856,9 @@ class OBBFastBot(ClientXMPP):
             notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
             if ADMIN_JID and notify_level == 'all':
                 self.send_message(mto=ADMIN_JID, mbody=f"🚫 Попытка передачи файла от {iq['from']}", mtype='chat')
-            self.send_message(mto=iq['from'], mbody=f"У вас нет прав для пользования ботом. Обратитесь к {ADMIN_JID}", mtype='chat')
+            self.send_message(mto=iq['from'],
+                              mbody=f"⚠️ Доступ запрещён. Пожалуйста, обратитесь к администратору для получения доступа: {ADMIN_JID}",
+                              mtype='chat')
             reply = iq.reply(); reply['type'] = 'error'; return reply.send()
 
         try:
