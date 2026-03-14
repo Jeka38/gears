@@ -15,6 +15,7 @@ class PresencePlugin(BasePlugin):
     async def start(self, event):
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
+        self.bot['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
         self.bot.send_presence(pstatus=STATUS_MESSAGE)
         await self.bot.get_roster()

@@ -28,6 +28,7 @@ class OBBFastBot(ClientXMPP):
 
         # Initialize core features via plugins
         self.register_plugin('xep_0030')
+        self.register_plugin('xep_0047')
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60

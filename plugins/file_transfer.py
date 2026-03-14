@@ -16,6 +16,7 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('S5B', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/bytestreams}query'), self.handle_raw_s5b)
         )
+        self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
 
     def handle_raw_si(self, iq):
         if not self.bot.is_allowed(iq['from']):
@@ -29,17 +30,45 @@ class FileTransferPlugin(BasePlugin):
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             logging.info(f"SI REQUEST: {fname} ({fsize} bytes) from {iq['from']}, sid={sid}")
+
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 logging.info(f"QUOTA EXCEEDED for {iq['from']}"); self.bot.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
                 reply = iq.reply(); reply['type'] = 'error'; return reply.send()
-            self.bot.pending_files[sid] = {'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time()}
+
+            # Parse stream methods
+            feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
+            offered_methods = []
+            if feature_neg is not None:
+                x_data = feature_neg.find('{jabber:x:data}x')
+                if x_data is not None:
+                    field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
+                    if field is not None:
+                        offered_methods = [v.text for v in field.findall('{jabber:x:data}value')]
+
+            chosen_method = None
+            if 'http://jabber.org/protocol/bytestreams' in offered_methods:
+                chosen_method = 'http://jabber.org/protocol/bytestreams'
+            elif 'http://jabber.org/protocol/ibb' in offered_methods:
+                chosen_method = 'http://jabber.org/protocol/ibb'
+
+            if not chosen_method:
+                logging.warning(f"No supported stream method offered by {iq['from']}")
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+
+            self.bot.pending_files[sid] = {
+                'name': fname,
+                'size': fsize,
+                'timestamp': asyncio.get_event_loop().time(),
+                'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods
+            }
+
             reply = iq.reply()
             res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
-            ET.SubElement(field, '{jabber:x:data}value').text = 'http://jabber.org/protocol/bytestreams'
+            ET.SubElement(field, '{jabber:x:data}value').text = chosen_method
             reply.append(res_si); reply.send()
         except Exception as e: logging.error(f"SI ERROR: {e}")
 
@@ -74,15 +103,31 @@ class FileTransferPlugin(BasePlugin):
                     res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
                     ET.SubElement(res_q, 'streamhost-used', jid=h_jid)
                     reply.append(res_q); reply.send()
-                    await self.download_file_task(reader, file_info, iq['from'])
+                    await self.download_file_task(reader, file_info, iq['from'], sid)
                     writer.close(); await writer.wait_closed(); return
                 except Exception: continue
-            reply = iq.reply(); reply['type'] = 'error'; reply.send()
-        except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
-        finally:
-            if sid in self.bot.pending_files: del self.bot.pending_files[sid]
 
-    async def download_file_task(self, reader, file_info, peer_jid):
+            # If we are here, all hosts failed
+            reply = iq.reply(); reply['type'] = 'error'; reply.send()
+
+            # If IBB was not an option, we should cleanup now.
+            if not file_info.get('ibb_allowed'):
+                if sid in self.bot.pending_files:
+                    del self.bot.pending_files[sid]
+        except Exception as e:
+            logging.error(f"SOCKS5 ERROR: {e}")
+
+    def handle_ibb_stream(self, stream):
+        sid = stream.sid
+        file_info = self.bot.pending_files.get(sid)
+        if file_info:
+            logging.info(f"IBB stream started for sid={sid}")
+            asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
+        else:
+            logging.warning(f"Unknown IBB stream sid={sid}")
+            stream.close()
+
+    async def download_file_task(self, reader, file_info, peer_jid, sid):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = os.path.join(user_dir, os.path.basename(file_info['name']))
         received = 0
@@ -100,3 +145,6 @@ class FileTransferPlugin(BasePlugin):
         except Exception as e:
             logging.error(f"Ошибка при приёме файла: {e}")
             if os.path.exists(path): os.remove(path)
+        finally:
+            if sid in self.bot.pending_files:
+                del self.bot.pending_files[sid]
