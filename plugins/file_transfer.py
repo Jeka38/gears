@@ -215,13 +215,13 @@ class FileTransferPlugin(BasePlugin):
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
 
             chosen_method = None
-            # Reorder for maximum reliability: IBB > SOCKS5
+            # Reorder for performance: OOB > SOCKS5 > IBB
             if 'jabber:iq:oob' in offered_methods:
                 chosen_method = 'jabber:iq:oob'
-            elif 'http://jabber.org/protocol/ibb' in offered_methods:
-                chosen_method = 'http://jabber.org/protocol/ibb'
             elif 'http://jabber.org/protocol/bytestreams' in offered_methods:
                 chosen_method = 'http://jabber.org/protocol/bytestreams'
+            elif 'http://jabber.org/protocol/ibb' in offered_methods:
+                chosen_method = 'http://jabber.org/protocol/ibb'
 
             if not chosen_method:
                 logging.warning(f"No supported stream method offered by {iq['from']}")
@@ -232,7 +232,8 @@ class FileTransferPlugin(BasePlugin):
                 'size': fsize,
                 'timestamp': asyncio.get_event_loop().time(),
                 'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
-                'peer_jid': iq['from']
+                'peer_jid': iq['from'],
+                'transport_sid': sid
             }
 
             reply = iq.reply()
@@ -367,5 +368,12 @@ class FileTransferPlugin(BasePlugin):
             logging.error(f"Ошибка при приёме файла: {e}")
             if os.path.exists(path): os.remove(path)
         finally:
+            # Cleanup both session and transport SIDs if they exist
+            info = self.bot.pending_files.get(sid)
+            if info:
+                t_sid = info.get('transport_sid')
+                if t_sid and t_sid in self.bot.pending_files:
+                    del self.bot.pending_files[t_sid]
+
             if sid in self.bot.pending_files:
                 del self.bot.pending_files[sid]
