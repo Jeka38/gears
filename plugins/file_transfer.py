@@ -5,7 +5,7 @@ import logging
 import aiohttp
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
-from utils import get_dir_size, safe_quote
+from utils import get_dir_size, safe_quote, get_unique_path
 from .base import BasePlugin
 
 class FileTransferPlugin(BasePlugin):
@@ -28,9 +28,12 @@ class FileTransferPlugin(BasePlugin):
     def handle_iq_oob(self, iq):
         logging.info(f"IQ OOB REQUEST from {iq['from']}")
         query = iq.xml.find('{jabber:iq:oob}query')
-        url = query.find('{jabber:iq:oob}url').text
-        fname = query.find('{jabber:iq:oob}desc')
-        fname = fname.text if fname is not None else os.path.basename(url)
+        if query is None: return
+        url_tag = query.find('{jabber:iq:oob}url')
+        if url_tag is None or not url_tag.text: return
+        url = url_tag.text
+        desc = query.find('{jabber:iq:oob}desc')
+        fname = desc.text if desc is not None and desc.text else os.path.basename(url)
         asyncio.create_task(self.download_from_url(url, fname, iq['from']))
         iq.reply().send()
 
@@ -39,6 +42,7 @@ class FileTransferPlugin(BasePlugin):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         fname = os.path.basename(fname).replace(' ', '_')
         path = get_unique_path(os.path.join(user_dir, fname))
+        loop = asyncio.get_event_loop()
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -50,7 +54,9 @@ class FileTransferPlugin(BasePlugin):
 
                         with open(path, 'wb') as f:
                             async for chunk in resp.content.iter_chunked(1048576):
-                                f.write(chunk)
+                                await loop.run_in_executor(None, f.write, chunk)
+                            await loop.run_in_executor(None, f.flush)
+                            await loop.run_in_executor(None, os.fsync, f.fileno())
 
                         real_fname = os.path.basename(path)
                         self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(real_fname)}", mtype='chat')
@@ -106,17 +112,23 @@ class FileTransferPlugin(BasePlugin):
             accept_iq = self.bot.make_iq_set(ito=iq['from'])
             res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-accept', 'sid': sid, 'initiator': iq['from'].full})
             res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': content.get('creator'), 'name': content.get('name')})
-            ET.SubElement(res_c, '{urn:xmpp:jingle:apps:file-transfer:5}description')
 
+            # XEP-0234 requires <file> in <description>
+            res_d = ET.SubElement(res_c, '{urn:xmpp:jingle:apps:file-transfer:5}description')
+            res_f = ET.SubElement(res_d, '{urn:xmpp:jingle:apps:file-transfer:5}file')
+            ET.SubElement(res_f, '{urn:xmpp:jingle:apps:file-transfer:5}name').text = fname
+            ET.SubElement(res_f, '{urn:xmpp:jingle:apps:file-transfer:5}size').text = str(fsize)
+
+            # Prefer IBB for reliability
             ibb_transport = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
-            s5b_transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             if ibb_transport is not None:
                 ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
-            elif s5b_transport is not None:
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
             else:
-                # Default to IBB if nothing recognized
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+                s5b_transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+                if s5b_transport is not None:
+                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
+                else:
+                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
             accept_iq.append(res_j); accept_iq.send()
 
         elif action == 'transport-info':
@@ -159,19 +171,24 @@ class FileTransferPlugin(BasePlugin):
             if feature_neg is not None:
                 x_data = feature_neg.find('{jabber:x:data}x')
                 if x_data is not None:
-                    field = x_data.find('{jabber:x:data}field[@var="stream-method"]')
+                    field = None
+                    for f in x_data.findall('{jabber:x:data}field'):
+                        if f.get('var') == 'stream-method':
+                            field = f
+                            break
                     if field is not None:
                         # Extract from <value> and <option><value>
                         offered_methods = [v.text for v in field.findall('{jabber:x:data}value')]
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
 
             chosen_method = None
+            # Reorder for maximum reliability: IBB > SOCKS5
             if 'jabber:iq:oob' in offered_methods:
                 chosen_method = 'jabber:iq:oob'
-            elif 'http://jabber.org/protocol/bytestreams' in offered_methods:
-                chosen_method = 'http://jabber.org/protocol/bytestreams'
             elif 'http://jabber.org/protocol/ibb' in offered_methods:
                 chosen_method = 'http://jabber.org/protocol/ibb'
+            elif 'http://jabber.org/protocol/bytestreams' in offered_methods:
+                chosen_method = 'http://jabber.org/protocol/bytestreams'
 
             if not chosen_method:
                 logging.warning(f"No supported stream method offered by {iq['from']}")
