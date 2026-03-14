@@ -136,14 +136,8 @@ class FileTransferPlugin(BasePlugin):
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname
                 ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
 
-                if ibb_t is not None:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
-                else:
-                    s5b_t = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
-                    if s5b_t is not None:
-                         ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
-                    else:
-                         ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+                # Jingle: always use SOCKS5 Bytestreams (do not use IBB here)
+                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
                 accept_iq.append(res_j); accept_iq.send()
             except Exception as e: logging.error(f"Error sending session-accept: {e}")
 
