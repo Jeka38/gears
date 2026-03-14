@@ -579,226 +579,240 @@ class OBBFastBot(ClientXMPP):
         def reply(text):
             self.send_message(mto=msg['from'], mbody=text, mtype='chat')
 
+        cmd_executed = False
+
         # Команды
         if cmd in ('help', '?'):
-            if len(parts) != 1: return
-            is_admin = ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower()
-            used = self.get_dir_size(user_dir)
-            help_text = self.get_help_text(is_admin, user_hash) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
-            reply(help_text)
+            if len(parts) == 1:
+                cmd_executed = True
+                is_admin = ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower()
+                used = self.get_dir_size(user_dir)
+                help_text = self.get_help_text(is_admin, user_hash) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
+                reply(help_text)
 
         elif cmd == 'ping':
-            if len(parts) != 1: return
-            reply("pong")
+            if len(parts) == 1:
+                cmd_executed = True
+                reply("pong")
 
         elif cmd == 'mkdir':
-            if len(parts) != 2: return
-            target = self.get_safe_path(user_dir, parts[1])
-            if target:
-                rel = os.path.relpath(target, user_dir)
-                if rel != "." and rel.count(os.sep) >= MAX_DIR_DEPTH:
-                    return reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
-                try:
-                    os.makedirs(target, exist_ok=True)
-                    reply(f"📁 Директория создана: {rel}")
-                except Exception as e:
-                    reply(f"❌ Ошибка: {e}")
-            else:
-                reply("❌ Недопустимый путь")
+            if len(parts) == 2:
+                cmd_executed = True
+                target = self.get_safe_path(user_dir, parts[1])
+                if target:
+                    rel = os.path.relpath(target, user_dir)
+                    if rel != "." and rel.count(os.sep) >= MAX_DIR_DEPTH:
+                        reply(f"❌ Ошибка: Максимальная глубина вложенности — {MAX_DIR_DEPTH} уровня")
+                    else:
+                        try:
+                            os.makedirs(target, exist_ok=True)
+                            reply(f"📁 Директория создана: {rel}")
+                        except Exception as e:
+                            reply(f"❌ Ошибка: {e}")
+                else:
+                    reply("❌ Недопустимый путь")
 
         elif cmd == 'rmdir':
-            if len(parts) != 2: return
-            items = self.get_all_items(user_dir)
-            resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
-            removed_count = 0
-            for target in resolved_paths:
-                if target and os.path.isdir(target):
-                    try:
-                        os.rmdir(target)
-                        removed_count += 1
-                    except Exception:
-                        pass
-            if removed_count:
-                reply(f"🗑 Удалено директорий: {removed_count}")
-            else:
-                reply("❌ Директории не найдены или не пусты")
-
-        elif cmd == 'mv':
-            if len(parts) != 3: return
-            items = self.get_all_items(user_dir)
-            dst = self.resolve_item(user_dir, parts[2], items)
-            if not dst:
-                return reply("❌ Недопустимый путь назначения")
-
-            resolved_srcs = self.resolve_items_list(user_dir, parts[1], items)
-            if not resolved_srcs:
-                return reply("❌ Объекты для перемещения не найдены")
-
-            if len(resolved_srcs) > 1:
-                if not os.path.isdir(dst):
-                    return reply("❌ При перемещении нескольких объектов назначение должно быть директорией")
-
-                moved_count = 0
-                for src in resolved_srcs:
-                    if os.path.abspath(src) == os.path.abspath(dst):
-                        continue
-
-                    new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
-                    rel_dst = os.path.relpath(new_dst, user_dir)
-
-                    is_dir = os.path.isdir(src)
-                    limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
-                    if rel_dst != "." and rel_dst.count(os.sep) > limit:
-                         continue
-
-                    try:
-                        new_dst = self.get_unique_path(new_dst)
-                        os.rename(src, new_dst)
-                        moved_count += 1
-                    except Exception:
-                        pass
-                reply(f"🚚 Перемещено объектов: {moved_count}")
-            else:
-                src = resolved_srcs[0]
-                if src and os.path.exists(src):
-                    try:
-                        # Если цель - директория, помещаем внутрь
-                        final_dst = dst
-                        if os.path.isdir(dst):
-                             final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
-
-                        rel_dst = os.path.relpath(final_dst, user_dir)
-                        is_dir = os.path.isdir(src)
-                        limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
-                        if rel_dst != "." and rel_dst.count(os.sep) > limit:
-                             return reply(f"❌ Ошибка: Превышена максимальная глубина вложенности")
-
-                        final_dst = self.get_unique_path(final_dst)
-                        os.rename(src, final_dst)
-                        reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(final_dst, user_dir)}")
-                    except Exception as e:
-                        reply(f"❌ Ошибка: {e}")
-                else:
-                    reply("❌ Файл не найден")
-
-        elif cmd in ('ls', 'lss', 'lsl'):
-            if len(parts) > 2: return
-            items = self.get_all_items(user_dir)
-            if not items:
-                return reply("📁 Папка пуста")
-
-            mode = 'links'
-            if cmd == 'lss': mode = 'size'
-            elif cmd == 'lsl': mode = 'long'
-            elif len(parts) == 2:
-                if parts[1] == '-s': mode = 'size'
-                elif parts[1] == '-l': mode = 'long'
-                else: return
-
-            res = []
-            for i, itm in enumerate(items):
-                depth = itm.count('/')
-                if itm.endswith('/'): depth -= 1
-
-                name = os.path.basename(itm.rstrip('/'))
-                if itm.endswith('/'): name += "/"
-
-                if depth > 0:
-                    display_itm = "    " * depth + "└── " + name
-                else:
-                    display_itm = name
-
-                full_path = os.path.join(user_dir, itm)
-
-                if mode == 'links':
-                    res.append(f"{i+1} - {display_itm}")
-                elif mode == 'size':
-                    if itm.endswith('/'):
-                        res.append(f"{i+1} - {display_itm} [директория]")
-                    else:
-                        size = self.format_size(os.path.getsize(full_path))
-                        res.append(f"{i+1} - {display_itm} [{size}]")
-                elif mode == 'long':
-                    st = os.stat(full_path)
-                    size = self.format_size(st.st_size)
-                    mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
-                    if itm.endswith('/'):
-                        res.append(f"{i+1} - {display_itm} (директория, {mtime})")
-                    else:
-                        res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
-            reply("\n" + "\n".join(res))
-
-        elif cmd in ('link', 'lnk'):
-            if len(parts) != 2: return
-            items = self.get_all_items(user_dir)
-            if not items:
-                return reply("📁 Папка пуста")
-
-            if parts[1] == '*':
-                res = []
-                for i, itm in enumerate(items):
-                    if not itm.endswith('/'):
-                        res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
-                reply("\n".join(res))
-            else:
-                resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
-                res = []
-                for path in resolved_paths:
-                    if not os.path.isdir(path):
-                        rel = os.path.relpath(path, user_dir)
-                        try: idx = items.index(rel if not os.path.isdir(path) else rel + "/")
-                        except ValueError: idx = -1
-                        res.append(f"{idx+1 if idx >=0 else '?'} - {self.base_url}/{user_hash}/{self.safe_quote(rel)}")
-                if res: reply("\n".join(res))
-
-        elif cmd == 'rm':
-            if not (2 <= len(parts) <= 3): return
-            items = self.get_all_items(user_dir)
-            if not items:
-                return reply("📁 Папка пуста")
-
-            if parts[1] == '*':
-                if len(parts) == 3 and parts[2].lower() == 'confirm':
-                    top_items = os.listdir(user_dir)
-                    for item in top_items:
-                        item_path = os.path.join(user_dir, item)
-                        try:
-                            if os.path.isdir(item_path): shutil.rmtree(item_path)
-                            else: os.remove(item_path)
-                        except Exception: pass
-                    reply("🗑 Все файлы и папки удалены.")
-                else:
-                    reply("⚠ Чтобы удалить ВСЕ файлы, напишите: rm * confirm")
-            else:
-                if len(parts) != 2: return
+            if len(parts) == 2:
+                cmd_executed = True
+                items = self.get_all_items(user_dir)
                 resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
                 removed_count = 0
-                for path in resolved_paths:
-                    try:
-                        if os.path.isdir(path): shutil.rmtree(path)
-                        else: os.remove(path)
-                        removed_count += 1
-                    except Exception: pass
-                if removed_count: reply(f"🗑 Удалено объектов: {removed_count}")
+                for target in resolved_paths:
+                    if target and os.path.isdir(target):
+                        try:
+                            os.rmdir(target)
+                            removed_count += 1
+                        except Exception:
+                            pass
+                if removed_count:
+                    reply(f"🗑 Удалено директорий: {removed_count}")
+                else:
+                    reply("❌ Директории не найдены или не пусты")
+
+        elif cmd == 'mv':
+            if len(parts) == 3:
+                cmd_executed = True
+                items = self.get_all_items(user_dir)
+                dst = self.resolve_item(user_dir, parts[2], items)
+                if not dst:
+                    reply("❌ Недопустимый путь назначения")
+                else:
+                    resolved_srcs = self.resolve_items_list(user_dir, parts[1], items)
+                    if not resolved_srcs:
+                        reply("❌ Объекты для перемещения не найдены")
+                    elif len(resolved_srcs) > 1:
+                        if not os.path.isdir(dst):
+                            reply("❌ При перемещении нескольких объектов назначение должно быть директорией")
+                        else:
+                            moved_count = 0
+                            for src in resolved_srcs:
+                                if os.path.abspath(src) == os.path.abspath(dst):
+                                    continue
+
+                                new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                                rel_dst = os.path.relpath(new_dst, user_dir)
+
+                                is_dir = os.path.isdir(src)
+                                limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
+                                if rel_dst != "." and rel_dst.count(os.sep) > limit:
+                                     continue
+
+                                try:
+                                    new_dst = self.get_unique_path(new_dst)
+                                    os.rename(src, new_dst)
+                                    moved_count += 1
+                                except Exception:
+                                    pass
+                            reply(f"🚚 Перемещено объектов: {moved_count}")
+                    else:
+                        src = resolved_srcs[0]
+                        if src and os.path.exists(src):
+                            try:
+                                # Если цель - директория, помещаем внутрь
+                                final_dst = dst
+                                if os.path.isdir(dst):
+                                     final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+
+                                rel_dst = os.path.relpath(final_dst, user_dir)
+                                is_dir = os.path.isdir(src)
+                                limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
+                                if rel_dst != "." and rel_dst.count(os.sep) > limit:
+                                     reply(f"❌ Ошибка: Превышена максимальная глубина вложенности")
+                                else:
+                                    final_dst = self.get_unique_path(final_dst)
+                                    os.rename(src, final_dst)
+                                    reply(f"🚚 Перемещено: {os.path.relpath(src, user_dir)} -> {os.path.relpath(final_dst, user_dir)}")
+                            except Exception as e:
+                                reply(f"❌ Ошибка: {e}")
+                        else:
+                            reply("❌ Файл не найден")
+
+        elif cmd in ('ls', 'lss', 'lsl'):
+            if len(parts) <= 2:
+                mode = 'links'
+                if cmd == 'lss': mode = 'size'
+                elif cmd == 'lsl': mode = 'long'
+                elif len(parts) == 2:
+                    if parts[1] == '-s': mode = 'size'
+                    elif parts[1] == '-l': mode = 'long'
+                    else: mode = None
+
+                if mode:
+                    cmd_executed = True
+                    items = self.get_all_items(user_dir)
+                    if not items:
+                        reply("📁 Папка пуста")
+                    else:
+                        res = []
+                        for i, itm in enumerate(items):
+                            depth = itm.count('/')
+                            if itm.endswith('/'): depth -= 1
+
+                            name = os.path.basename(itm.rstrip('/'))
+                            if itm.endswith('/'): name += "/"
+
+                            if depth > 0:
+                                display_itm = "    " * depth + "└── " + name
+                            else:
+                                display_itm = name
+
+                            full_path = os.path.join(user_dir, itm)
+
+                            if mode == 'links':
+                                res.append(f"{i+1} - {display_itm}")
+                            elif mode == 'size':
+                                if itm.endswith('/'):
+                                    res.append(f"{i+1} - {display_itm} [директория]")
+                                else:
+                                    size = self.format_size(os.path.getsize(full_path))
+                                    res.append(f"{i+1} - {display_itm} [{size}]")
+                            elif mode == 'long':
+                                st = os.stat(full_path)
+                                size = self.format_size(st.st_size)
+                                mtime = datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
+                                if itm.endswith('/'):
+                                    res.append(f"{i+1} - {display_itm} (директория, {mtime})")
+                                else:
+                                    res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
+                        reply("\n" + "\n".join(res))
+
+        elif cmd in ('link', 'lnk'):
+            if len(parts) == 2:
+                cmd_executed = True
+                items = self.get_all_items(user_dir)
+                if not items:
+                    reply("📁 Папка пуста")
+                elif parts[1] == '*':
+                    res = []
+                    for i, itm in enumerate(items):
+                        if not itm.endswith('/'):
+                            res.append(f"{i+1} - {self.base_url}/{user_hash}/{self.safe_quote(itm)}")
+                    reply("\n".join(res))
+                else:
+                    resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
+                    res = []
+                    for path in resolved_paths:
+                        if not os.path.isdir(path):
+                            rel = os.path.relpath(path, user_dir)
+                            try: idx = items.index(rel if not os.path.isdir(path) else rel + "/")
+                            except ValueError: idx = -1
+                            res.append(f"{idx+1 if idx >=0 else '?'} - {self.base_url}/{user_hash}/{self.safe_quote(rel)}")
+                    if res: reply("\n".join(res))
+
+        elif cmd == 'rm':
+            if 2 <= len(parts) <= 3:
+                cmd_executed = True
+                items = self.get_all_items(user_dir)
+                if not items:
+                    reply("📁 Папка пуста")
+                elif parts[1] == '*':
+                    if len(parts) == 3 and parts[2].lower() == 'confirm':
+                        top_items = os.listdir(user_dir)
+                        for item in top_items:
+                            item_path = os.path.join(user_dir, item)
+                            try:
+                                if os.path.isdir(item_path): shutil.rmtree(item_path)
+                                else: os.remove(item_path)
+                            except Exception: pass
+                        reply("🗑 Все файлы и папки удалены.")
+                    else:
+                        reply("⚠ Чтобы удалить ВСЕ файлы, напишите: rm * confirm")
+                else:
+                    if len(parts) == 2:
+                        resolved_paths = self.resolve_items_list(user_dir, parts[1], items)
+                        removed_count = 0
+                        for path in resolved_paths:
+                            try:
+                                if os.path.isdir(path): shutil.rmtree(path)
+                                else: os.remove(path)
+                                removed_count += 1
+                            except Exception: pass
+                        if removed_count: reply(f"🗑 Удалено объектов: {removed_count}")
 
         elif cmd == 'priv':
-            index_path = os.path.join(user_dir, 'index.html')
-            if not os.path.exists(index_path):
-                with open(index_path, 'w') as f:
-                    f.write("<html><body><h1>Private Archive</h1></body></html>")
-                reply("🔒 Архив теперь приватный (создан index.html)")
-            else: reply("ℹ Архив уже приватный.")
+            if len(parts) == 1:
+                cmd_executed = True
+                index_path = os.path.join(user_dir, 'index.html')
+                if not os.path.exists(index_path):
+                    with open(index_path, 'w') as f:
+                        f.write("<html><body><h1>Private Archive</h1></body></html>")
+                    reply("🔒 Архив теперь приватный (создан index.html)")
+                else: reply("ℹ Архив уже приватный.")
 
         elif cmd == 'pub':
-            index_path = os.path.join(user_dir, 'index.html')
-            if os.path.exists(index_path):
-                os.remove(index_path)
-                reply("🔓 Архив теперь публичный (удалён index.html)")
-            else: reply("ℹ Архив уже публичный.")
+            if len(parts) == 1:
+                cmd_executed = True
+                index_path = os.path.join(user_dir, 'index.html')
+                if os.path.exists(index_path):
+                    os.remove(index_path)
+                    reply("🔓 Архив теперь публичный (удалён index.html)")
+                else: reply("ℹ Архив уже публичный.")
 
         # Админ-команды
-        if ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower():
+        if not cmd_executed and ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower():
             if cmd == 'add' and len(parts) == 2:
+                cmd_executed = True
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
                 added = []
                 for entry in entries:
@@ -811,6 +825,7 @@ class OBBFastBot(ClientXMPP):
                 else: reply("⚠ Неверный формат. Используйте user@domain, domain или *")
 
             elif cmd == 'del' and len(parts) == 2:
+                cmd_executed = True
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
                 whitelist = self.db.get_whitelist()
                 removed = []
@@ -822,6 +837,7 @@ class OBBFastBot(ClientXMPP):
                 else: reply("❓ Ничего не найдено для удаления из белого списка.")
 
             elif cmd == 'block' and len(parts) == 2:
+                cmd_executed = True
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
                 added = []
                 for entry in entries:
@@ -832,6 +848,7 @@ class OBBFastBot(ClientXMPP):
                 else: reply("⚠ Неверный формат. Используйте user@domain или domain")
 
             elif cmd == 'unblock' and len(parts) == 2:
+                cmd_executed = True
                 entries = [e.strip().lower() for e in parts[1].split(',') if e.strip()]
                 blacklist = self.db.get_blacklist()
                 removed = []
@@ -843,11 +860,19 @@ class OBBFastBot(ClientXMPP):
                 else: reply("❓ Ничего не найдено для удаления из чёрного списка.")
 
             elif cmd == 'list' and len(parts) == 1:
+                cmd_executed = True
                 whitelist = self.db.get_whitelist()
                 blacklist = self.db.get_blacklist()
                 res_w = "\n".join(sorted(whitelist))
                 res_b = "\n".join(sorted(blacklist))
                 reply(f"📄 Белый список:\n{res_w or '(пусто)'}\n\n🚫 Чёрный список:\n{res_b or '(пусто)'}")
+
+        # Если команда не выполнена, шлем справку
+        if not cmd_executed:
+            is_admin = ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower()
+            used = self.get_dir_size(user_dir)
+            help_text = self.get_help_text(is_admin, user_hash) + f"\n\n📊 Квота: {self.format_size(used)} / {self.format_size(QUOTA_LIMIT_BYTES)}"
+            reply(help_text)
 
     # SI handler
     def handle_raw_si(self, iq):
