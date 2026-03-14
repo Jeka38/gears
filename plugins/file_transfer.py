@@ -2,6 +2,7 @@ import os
 import hashlib
 import asyncio
 import logging
+import aiohttp
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
 from utils import get_dir_size, safe_quote
@@ -19,7 +20,45 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('Jingle', matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:jingle:1}jingle'), self.handle_jingle)
         )
+        self.bot.register_handler(
+            handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
+        )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+
+    def handle_iq_oob(self, iq):
+        logging.info(f"IQ OOB REQUEST from {iq['from']}")
+        query = iq.xml.find('{jabber:iq:oob}query')
+        url = query.find('{jabber:iq:oob}url').text
+        fname = query.find('{jabber:iq:oob}desc')
+        fname = fname.text if fname is not None else os.path.basename(url)
+        asyncio.create_task(self.download_from_url(url, fname, iq['from']))
+        iq.reply().send()
+
+    async def download_from_url(self, url, fname, peer_jid):
+        logging.info(f"Downloading OOB from {url}")
+        user_dir, user_hash = self.bot.get_user_info(peer_jid)
+        fname = os.path.basename(fname).replace(' ', '_')
+        path = get_unique_path(os.path.join(user_dir, fname))
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=300) as resp:
+                    if resp.status == 200:
+                        fsize = int(resp.headers.get('Content-Length', 0))
+                        if fsize > 0 and get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                             self.bot.send_message(mto=peer_jid, mbody="⚠ Квота превышена!", mtype='chat'); return
+
+                        with open(path, 'wb') as f:
+                            async for chunk in resp.content.iter_chunked(1048576):
+                                f.write(chunk)
+
+                        real_fname = os.path.basename(path)
+                        self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(real_fname)}", mtype='chat')
+                    else:
+                        logging.error(f"OOB download failed: HTTP {resp.status}")
+        except Exception as e:
+            logging.error(f"OOB download error: {e}")
+            if os.path.exists(path): os.remove(path)
 
     def handle_jingle(self, iq):
         logging.info(f"JINGLE REQUEST from {iq['from']}")
@@ -91,6 +130,11 @@ class FileTransferPlugin(BasePlugin):
                         asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
             iq.reply().send()
 
+        elif action == 'session-terminate':
+            if sid in self.bot.pending_files:
+                del self.bot.pending_files[sid]
+            iq.reply().send()
+
     def handle_raw_si(self, iq):
         if not self.bot.is_allowed(iq['from']):
             logging.info(f"ACCESS DENIED (SI) from {iq['from']}")
@@ -122,7 +166,9 @@ class FileTransferPlugin(BasePlugin):
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
 
             chosen_method = None
-            if 'http://jabber.org/protocol/bytestreams' in offered_methods:
+            if 'jabber:iq:oob' in offered_methods:
+                chosen_method = 'jabber:iq:oob'
+            elif 'http://jabber.org/protocol/bytestreams' in offered_methods:
                 chosen_method = 'http://jabber.org/protocol/bytestreams'
             elif 'http://jabber.org/protocol/ibb' in offered_methods:
                 chosen_method = 'http://jabber.org/protocol/ibb'
