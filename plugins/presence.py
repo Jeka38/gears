@@ -13,6 +13,15 @@ class PresencePlugin(BasePlugin):
         self.bot.add_event_handler("presence_unsubscribed", self.handle_presence_unsubscribed)
 
     async def start(self, event):
+        # Start HTTP Upload server
+        from aiohttp import web
+        from config import HTTP_UPLOAD_PORT
+        self.bot.http_runner = web.AppRunner(self.bot.http_app)
+        await self.bot.http_runner.setup()
+        site = web.TCPSite(self.bot.http_runner, '0.0.0.0', HTTP_UPLOAD_PORT)
+        await site.start()
+        logging.info(f"🌐 HTTP Upload server started on port {HTTP_UPLOAD_PORT}")
+
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
@@ -23,6 +32,7 @@ class PresencePlugin(BasePlugin):
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
         self.bot['xep_0030'].add_feature('jabber:iq:oob')
         self.bot['xep_0030'].add_feature('jabber:x:oob')
+        self.bot['xep_0030'].add_feature('urn:xmpp:http:upload:0')
         self.bot.send_presence(pstatus=STATUS_MESSAGE)
         await self.bot.get_roster()
         logging.info(f"✅ БОТ ЗАПУЩЕН: {self.bot.boundjid}")

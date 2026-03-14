@@ -23,7 +23,33 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
+        self.bot.register_handler(
+            handler.Callback('HTTP Upload', matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:http:upload:0}request'), self.handle_http_upload_request)
+        )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+
+    def handle_http_upload_request(self, iq):
+        logging.info(f"HTTP UPLOAD REQUEST from {iq['from']}")
+        request = iq.xml.find('{urn:xmpp:http:upload:0}request')
+        fname = os.path.basename(request.get('filename')).replace(' ', '_')
+        fsize = int(request.get('size', 0))
+
+        user_dir, user_hash = self.bot.get_user_info(iq['from'])
+        if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+            reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+
+        import uuid
+        token = str(uuid.uuid4())
+        self.bot.pending_files[f"upload_{token}"] = {'peer_jid': iq['from'], 'timestamp': asyncio.get_event_loop().time()}
+
+        put_url = f"{self.bot.base_url}/upload/{token}/{safe_quote(fname)}"
+        get_url = f"{self.bot.base_url}/{user_hash}/{safe_quote(fname)}"
+
+        reply = iq.reply()
+        res_slot = ET.Element('{urn:xmpp:http:upload:0}slot')
+        ET.SubElement(res_slot, 'put', url=put_url)
+        ET.SubElement(res_slot, 'get', url=get_url)
+        reply.append(res_slot); reply.send()
 
     def handle_iq_oob(self, iq):
         logging.info(f"IQ OOB REQUEST from {iq['from']}")
@@ -34,7 +60,7 @@ class FileTransferPlugin(BasePlugin):
         url = url_tag.text
         desc = query.find('{jabber:iq:oob}desc')
         fname = desc.text if desc is not None and desc.text else os.path.basename(url)
-        asyncio.create_task(self.download_from_url(url, fname, iq['from']))
+        self.bot.pending_files[f"oob_{url}"] = asyncio.create_task(self.download_from_url(url, fname, iq['from']))
         iq.reply().send()
 
     async def download_from_url(self, url, fname, peer_jid):
@@ -131,18 +157,29 @@ class FileTransferPlugin(BasePlugin):
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname
                 ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
 
-                # Jingle: always use SOCKS5 Bytestreams for speed. Provide Proxy65 candidates to help.
-                res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
-                for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
-                    ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
-                                  host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(),
-                                  priority='65536', type='proxy')
+                # Negotiate transport: match what initiator offered, prefer SOCKS5
+                if s5b_t is not None:
+                    res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
+                    # Provide Proxy65 candidates to help with NAT
+                    for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
+                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
+                                      host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(),
+                                      priority='65536', type='proxy')
+                elif ibb_t is not None:
+                    # Fallback to IBB if ONLY IBB was offered
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
+                        'block-size': ibb_t.get('block-size', '4096'),
+                        'sid': transport_sid
+                    })
+                else:
+                    # Default fallback to IBB
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
 
                 accept_iq.append(res_j); accept_iq.send()
 
                 if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
                     self.bot.pending_files[sid]['s5b_connecting'] = True
-                    asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+                    self.bot.pending_files[f"jingle_s5b_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
             except Exception as e: logging.error(f"Error sending session-accept: {e}")
 
         elif action == 'transport-info':
@@ -154,7 +191,7 @@ class FileTransferPlugin(BasePlugin):
                     if transport is not None:
                         if not self.bot.pending_files.get(sid, {}).get('s5b_connecting'):
                             self.bot.pending_files[sid]['s5b_connecting'] = True
-                            asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+                            self.bot.pending_files[f"jingle_s5b_info_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
             iq.reply().send()
 
         elif action == 'session-terminate':
@@ -206,7 +243,7 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}")
-        asyncio.create_task(self._socks5_connect_and_save(iq))
+        self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq))
 
     async def _socks5_connect_and_save(self, iq, jingle_sid=None):
         sid = None
@@ -285,7 +322,7 @@ class FileTransferPlugin(BasePlugin):
             if file_info['peer_jid'].bare != stream.peer_jid.bare:
                 stream.close(); return
             logging.info(f"IBB stream started for sid={sid}")
-            asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
+            self.bot.pending_files[f"task_{sid}"] = asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
         else: stream.close()
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
