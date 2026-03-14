@@ -140,13 +140,23 @@ class FileTransferPlugin(BasePlugin):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = os.path.join(user_dir, os.path.basename(file_info['name']))
         received = 0
+        loop = asyncio.get_event_loop()
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    chunk = await reader.read(min(file_info['size'] - received, 1048576))
+                    # IBB reader is IBBytestream, SOCKS5 is asyncio.StreamReader
+                    if hasattr(reader, 'recv_queue'):
+                        chunk = await reader.recv_queue.get()
+                    else:
+                        chunk = await reader.read(min(file_info['size'] - received, 1048576))
+
                     if not chunk: break
-                    f.write(chunk); received += len(chunk)
-                f.flush(); os.fsync(f.fileno())
+                    await loop.run_in_executor(None, f.write, chunk)
+                    received += len(chunk)
+
+                await loop.run_in_executor(None, f.flush)
+                await loop.run_in_executor(None, os.fsync, f.fileno())
+
             if received == file_info['size']:
                 self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(file_info['name'])}", mtype='chat')
             else:
