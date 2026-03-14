@@ -48,8 +48,8 @@ class OBBFastBot(ClientXMPP):
 
         # Load logical modules (plugins)
         self.presence = PresencePlugin(self)
-        self.commands = CommandsPlugin(self)
         self.file_transfer = FileTransferPlugin(self)
+        self.commands = CommandsPlugin(self)
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")

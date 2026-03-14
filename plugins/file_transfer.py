@@ -131,12 +131,12 @@ class FileTransferPlugin(BasePlugin):
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname
                 ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
 
-                if s5b_t is not None:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
-                elif ibb_t is not None:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
-                else:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+                # Jingle: always use SOCKS5 Bytestreams for speed. Provide Proxy65 candidates to help.
+                res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
+                for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
+                    ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
+                                  host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(),
+                                  priority='65536', type='proxy')
 
                 accept_iq.append(res_j); accept_iq.send()
 
