@@ -136,8 +136,23 @@ class FileTransferPlugin(BasePlugin):
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname
                 ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
 
-                # Jingle: always use SOCKS5 Bytestreams (do not use IBB here)
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
+                # Negotiate transport: match what initiator offered
+                s5b_t = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+                ibb_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+
+                if s5b_t is not None:
+                    # Prefer SOCKS5 if offered
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid, 'mode': 'tcp'})
+                elif ibb_t is not None:
+                    # Fallback to IBB if offered
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
+                        'block-size': ibb_t.get('block-size', '4096'),
+                        'sid': transport_sid
+                    })
+                else:
+                    # Default fallback
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+
                 accept_iq.append(res_j); accept_iq.send()
             except Exception as e: logging.error(f"Error sending session-accept: {e}")
 
@@ -316,7 +331,7 @@ class FileTransferPlugin(BasePlugin):
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
-        path = os.path.join(user_dir, os.path.basename(file_info['name']))
+        path = get_unique_path(os.path.join(user_dir, os.path.basename(file_info['name'])))
         received = 0
         loop = asyncio.get_event_loop()
         try:
@@ -336,7 +351,8 @@ class FileTransferPlugin(BasePlugin):
                 await loop.run_in_executor(None, os.fsync, f.fileno())
 
             if received == file_info['size']:
-                self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(file_info['name'])}", mtype='chat')
+                real_fname = os.path.basename(path)
+                self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(real_fname)}", mtype='chat')
             else:
                 if os.path.exists(path): os.remove(path)
         except Exception as e:
