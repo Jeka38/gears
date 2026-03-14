@@ -67,10 +67,10 @@ class FileTransferPlugin(BasePlugin):
             if os.path.exists(path): os.remove(path)
 
     def handle_jingle(self, iq):
-        logging.info(f"JINGLE REQUEST ({iq.xml.find('{urn:xmpp:jingle:1}jingle').get('action')}) from {iq['from']}")
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action = jingle.get('action')
+        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}\n{ET.tostring(iq.xml, encoding='unicode')}")
         sid = jingle.get('sid')
 
         if action == 'session-initiate':
