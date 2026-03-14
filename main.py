@@ -525,9 +525,6 @@ class OBBFastBot(ClientXMPP):
     def handle_presence_subscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"🆕 Запрос подписки от {jid}")
-        notify_level = os.getenv('ADMIN_NOTIFY_LEVEL', 'all').lower()
-        if ADMIN_JID and notify_level == 'all':
-            self.send_message(mto=ADMIN_JID, mbody=f"➕ Пользователь {jid} отправил запрос на подписку", mtype='chat')
         self.send_presence(pto=jid, ptype='subscribed')
         self.send_presence(pto=jid, ptype='subscribe')
         is_admin = ADMIN_JID and jid == ADMIN_JID.lower()
@@ -538,10 +535,14 @@ class OBBFastBot(ClientXMPP):
     def handle_presence_subscribed(self, presence):
         jid = presence['from'].bare
         logging.info(f"✅ Подписка подтверждена от {jid}")
+        if ADMIN_JID:
+            self.send_message(mto=ADMIN_JID, mbody=f"✅ Пользователь {jid} добавил бота в контакты", mtype='chat')
 
     def handle_presence_unsubscribe(self, presence):
         jid = presence['from'].bare
         logging.info(f"➖ Запрос отписки от {jid}")
+        if ADMIN_JID:
+            self.send_message(mto=ADMIN_JID, mbody=f"➖ Пользователь {jid} удалил бота из контактов", mtype='chat')
 
     def handle_presence_unsubscribed(self, presence):
         jid = presence['from'].bare
