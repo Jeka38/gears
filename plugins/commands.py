@@ -17,6 +17,7 @@ class CommandsPlugin(BasePlugin):
         if msg['type'] not in ('chat', 'normal') or not msg['body']:
             return
         if not self.bot.is_allowed(msg['from']):
+            self.reply(msg, f"⚠️ Доступ запрещён. Пожалуйста, обратитесь к администратору для получения доступа: {ADMIN_JID}")
             return
 
         parts = msg['body'].strip().split()

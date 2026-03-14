@@ -13,9 +13,9 @@ def format_size(size):
     return f"{size:.1f} ГБ".replace('.', ',')
 
 def get_dir_size(path):
-    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно)"""
+    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html"""
     return sum(os.path.getsize(os.path.join(d, f))
-               for d, _, fs in os.walk(path) for f in fs)
+               for d, _, fs in os.walk(path) for f in fs if f != 'index.html')
 
 def safe_quote(text):
     """Красивое кодирование URL (сохраняем кириллицу для читаемости)"""
