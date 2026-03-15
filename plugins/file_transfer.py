@@ -85,7 +85,7 @@ class FileTransferPlugin(BasePlugin):
         logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                iq.error('not-authorized').send(); return
             content = jingle.find('{urn:xmpp:jingle:1}content')
             if content is None: return
             ft_ns = 'urn:xmpp:jingle:apps:file-transfer:5'
@@ -102,10 +102,11 @@ class FileTransferPlugin(BasePlugin):
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                iq.error('not-allowed', text="Quota exceeded").send(); return
             ibb_t, s5b_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport'), content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             if s5b_t is not None and s5b_t.get('sid'): transport_sid = s5b_t.get('sid')
             elif ibb_t is not None and ibb_t.get('sid'): transport_sid = ibb_t.get('sid')
+            elif jingle.get('sid'): transport_sid = jingle.get('sid')
             else: transport_sid = sid
             self.bot.pending_files[sid] = {
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
@@ -116,7 +117,7 @@ class FileTransferPlugin(BasePlugin):
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
             iq.reply().send()
             try:
-                accept_iq = self.bot.make_iq_set(ito=iq['from'])
+                accept_iq = self.bot.Iq(); accept_iq['type'] = 'set'; accept_iq['to'] = iq['from']
                 res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-accept', 'sid': sid, 'initiator': iq['from'].full})
                 res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': content.get('creator'), 'name': content.get('name')})
                 res_d = ET.SubElement(res_c, f'{{{ft_ns}}}description')
@@ -133,8 +134,10 @@ class FileTransferPlugin(BasePlugin):
                                   cid='direct-host', priority='8253074', type='host')
 
                     # Proxy candidates
-                    for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
-                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
+                    for p_jid, p_info in self.KNOWN_PROXIES.items():
+                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
+                                      host=p_info['host'], port=str(p_info['port']), jid=p_jid,
+                                      cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
                 elif ibb_t is not None:
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
                 else:
@@ -162,7 +165,7 @@ class FileTransferPlugin(BasePlugin):
                         ibb_sid = ibb_t.get('sid')
                         self.bot.pending_files[sid]['transport_sid'] = ibb_sid
                         self.bot.pending_files[ibb_sid] = self.bot.pending_files[sid]
-                        reply = self.bot.make_iq_set(ito=iq['from'])
+                        reply = self.bot.Iq(); reply['type'] = 'set'; reply['to'] = iq['from']
                         res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-accept', 'sid': sid})
                         res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                             'creator': content.get('creator'), 'name': content.get('name')
@@ -179,14 +182,14 @@ class FileTransferPlugin(BasePlugin):
     def handle_raw_si(self, iq):
         logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
-            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+            return iq.error('not-authorized').send()
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                return iq.error('not-allowed', text="Quota exceeded").send()
             feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
             offered_methods = []
             if feature_neg is not None:
@@ -216,6 +219,11 @@ class FileTransferPlugin(BasePlugin):
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
+        if query is not None:
+            sid = query.get('sid')
+            used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
+            if used is not None:
+                logging.info(f"S5B streamhost-used: {used.get('jid')} for sid={sid}")
         if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
              asyncio.create_task(self._socks5_connect_and_save(iq))
         else:
@@ -273,7 +281,7 @@ class FileTransferPlugin(BasePlugin):
                     elif atyp == 0x03: addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
                     elif atyp == 0x04: await reader.read(18)
                     if jingle_sid:
-                        reply = self.bot.make_iq_set(ito=iq['from'])
+                        reply = self.bot.Iq(); reply['type'] = 'set'; reply['to'] = iq['from']
                         res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-info', 'sid': jingle_sid})
                         res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': file_info.get('content_creator', 'initiator'), 'name': file_info.get('content_name', 'file')})
                         res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid})
@@ -289,14 +297,14 @@ class FileTransferPlugin(BasePlugin):
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if not jingle_sid:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send()
+                iq.error('item-not-found').send()
             elif file_info.get('ibb_allowed'):
                 logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
                 new_ibb_sid = f"fallback_{sid}"
                 self.bot.pending_files[sid]['transport_sid'] = new_ibb_sid
                 self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
 
-                reply = self.bot.make_iq_set(ito=iq['from'])
+                reply = self.bot.Iq(); reply['type'] = 'set'; reply['to'] = iq['from']
                 res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
                 res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                     'creator': file_info.get('content_creator', 'initiator'),
@@ -328,7 +336,7 @@ class FileTransferPlugin(BasePlugin):
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    if hasattr(reader, 'recv_queue'): chunk = await reader.recv_queue.get()
+                    if hasattr(reader, 'get'): chunk = await reader.get()
                     else: chunk = await reader.read(min(file_info['size'] - received, 1048576))
                     if not chunk: break
                     await loop.run_in_executor(None, f.write, chunk); received += len(chunk)
