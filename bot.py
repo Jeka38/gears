@@ -51,44 +51,6 @@ class OBBFastBot(ClientXMPP):
         self.file_transfer = FileTransferPlugin(self)
         self.commands = CommandsPlugin(self)
 
-        # HTTP Upload server (XEP-0363)
-        from aiohttp import web
-        self.http_app = web.Application()
-        self.http_app.router.add_put('/upload/{token}/{filename}', self.handle_http_upload)
-        self.http_runner = None
-
-    async def handle_http_upload(self, request):
-        token = request.match_info.get('token')
-        filename = request.match_info.get('filename')
-
-        file_info = self.pending_files.get(f"upload_{token}")
-        if not file_info:
-            return web.Response(status=403, text="Invalid or expired token")
-
-        peer_jid = file_info['peer_jid']
-        user_dir, user_hash = self.get_user_info(peer_jid)
-
-        from utils import get_unique_path
-        path = get_unique_path(os.path.join(user_dir, os.path.basename(filename).replace(' ', '_')))
-
-        try:
-            with open(path, 'wb') as f:
-                async for chunk in request.content.iter_chunked(1048576):
-                    await asyncio.get_event_loop().run_in_executor(None, f.write, chunk)
-                await asyncio.get_event_loop().run_in_executor(None, f.flush)
-                await asyncio.get_event_loop().run_in_executor(None, os.fsync, f.fileno())
-
-            real_fname = os.path.basename(path)
-            from utils import safe_quote
-            self.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_quote(real_fname)}", mtype='chat')
-            return web.Response(status=201)
-        except Exception as e:
-            logging.error(f"HTTP UPLOAD ERROR: {e}")
-            if os.path.exists(path): os.remove(path)
-            return web.Response(status=500)
-        finally:
-            if f"upload_{token}" in self.pending_files:
-                del self.pending_files[f"upload_{token}"]
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")

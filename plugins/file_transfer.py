@@ -30,30 +30,7 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
-        self.bot.register_handler(
-            handler.Callback('HTTP Upload', matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:http:upload:0}request'), self.handle_http_upload_request)
-        )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
-
-    def handle_http_upload_request(self, iq):
-        logging.info(f"HTTP UPLOAD REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
-        request = iq.xml.find('{urn:xmpp:http:upload:0}request')
-        fname = os.path.basename(request.get('filename')).replace(' ', '_')
-        try: fsize = int(request.get('size', 0))
-        except (ValueError, TypeError): fsize = 0
-        user_dir, user_hash = self.bot.get_user_info(iq['from'])
-        if fsize > 0 and get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-            reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
-        import uuid
-        token = str(uuid.uuid4())
-        self.bot.pending_files[f"upload_{token}"] = {'peer_jid': iq['from'], 'timestamp': asyncio.get_event_loop().time()}
-        put_url = f"{self.bot.base_url}/upload/{token}/{safe_quote(fname)}"
-        get_url = f"{self.bot.base_url}/{user_hash}/{safe_quote(fname)}"
-        reply = iq.reply()
-        res_slot = ET.Element('{urn:xmpp:http:upload:0}slot')
-        ET.SubElement(res_slot, 'put', url=put_url)
-        ET.SubElement(res_slot, 'get', url=get_url)
-        reply.append(res_slot); reply.send()
 
     def handle_iq_oob(self, iq):
         logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
@@ -134,11 +111,16 @@ class FileTransferPlugin(BasePlugin):
                 res_d = ET.SubElement(res_c, f'{{{ft_ns}}}description')
                 res_f = ET.SubElement(res_d, f'{{{ft_ns}}}file')
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname; ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
+
                 if s5b_t is not None:
                     res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
                     for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
-                else: ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
+                elif ibb_t is not None:
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
+                else:
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+
                 accept_iq.append(res_j); accept_iq.send()
                 if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
                     self.bot.pending_files[sid]['s5b_connecting'] = True
@@ -195,10 +177,8 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
-        # Identify if this is a response to our proxy offer or a new request
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
         if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
-             # Initiator notifying us of proxy choice
              asyncio.create_task(self._socks5_connect_and_save(iq))
         else:
              self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq))
@@ -219,19 +199,13 @@ class FileTransferPlugin(BasePlugin):
                 query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
                 if query is None: return
                 sid, peer_full = query.get('sid'), iq['from'].full
-
-                # Check for streamhost-used (Initiator chose one of OUR proxies)
                 used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
                 if used is not None:
-                    jid = used.get('jid')
-                    proxy = self.KNOWN_PROXIES.get(jid)
-                    if proxy:
-                        hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
-                    else:
-                        reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                    jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
+                    if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
+                    else: reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
-
                 if not hosts and used is None:
                     reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
                     for p_jid, p_info in self.KNOWN_PROXIES.items():
@@ -260,7 +234,6 @@ class FileTransferPlugin(BasePlugin):
                         ET.SubElement(res_t, 'candidate-used', cid=host.get('cid'))
                         reply.append(res_j); reply.send()
                     else:
-                        # Acknowledge streamhost-used or original request
                         reply = iq.reply()
                         if used is None:
                             res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
