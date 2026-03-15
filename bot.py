@@ -28,6 +28,8 @@ class OBBFastBot(ClientXMPP):
 
         # Initialize core features via plugins
         self.register_plugin('xep_0030')
+        self.register_plugin('xep_0047')
+        self['xep_0047'].auto_accept = True
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
@@ -46,8 +48,9 @@ class OBBFastBot(ClientXMPP):
 
         # Load logical modules (plugins)
         self.presence = PresencePlugin(self)
-        self.commands = CommandsPlugin(self)
         self.file_transfer = FileTransferPlugin(self)
+        self.commands = CommandsPlugin(self)
+
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")
@@ -59,10 +62,17 @@ class OBBFastBot(ClientXMPP):
             try:
                 await asyncio.sleep(60)
                 now = asyncio.get_event_loop().time()
-                to_delete = [sid for sid, info in self.pending_files.items()
-                             if now - info.get('timestamp', now) > 600]
+                to_delete = []
+                for sid, info in self.pending_files.items():
+                    if isinstance(info, dict):
+                        if now - info.get('timestamp', now) > 600:
+                            to_delete.append(sid)
+                    elif isinstance(info, asyncio.Task):
+                        if info.done():
+                            to_delete.append(sid)
+
                 for sid in to_delete:
-                    logging.info(f"CLEANUP: Expiring pending file sid={sid}")
+                    logging.info(f"CLEANUP: Removing pending item sid={sid}")
                     del self.pending_files[sid]
             except Exception as e:
                 logging.error(f"CLEANUP ERROR: {e}")
