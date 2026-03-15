@@ -1,4 +1,5 @@
 import os
+import socket
 import hashlib
 import asyncio
 import logging
@@ -9,6 +10,15 @@ from utils import get_dir_size, safe_quote, get_unique_path
 from .base import BasePlugin
 
 class FileTransferPlugin(BasePlugin):
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(('8.8.8.8', 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except: return '127.0.0.1'
+
     KNOWN_PROXIES = {
         'proxy.eu.jabber.network': {'host': 'proxy.eu.jabber.network', 'port': 1080},
         'proxy.jabber.ru': {'host': 'proxy.jabber.ru', 'port': 1080},
@@ -114,6 +124,14 @@ class FileTransferPlugin(BasePlugin):
 
                 if s5b_t is not None:
                     res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp'})
+
+                    # Direct candidate
+                    local_ip = self.get_local_ip()
+                    ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
+                                  host=local_ip, port='1080', jid=self.bot.boundjid.full,
+                                  cid='direct-host', priority='8253074', type='host')
+
+                    # Proxy candidates
                     for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
                 elif ibb_t is not None:
