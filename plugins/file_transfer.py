@@ -9,6 +9,13 @@ from utils import get_dir_size, safe_quote, get_unique_path
 from .base import BasePlugin
 
 class FileTransferPlugin(BasePlugin):
+    KNOWN_PROXIES = {
+        'proxy.eu.jabber.network': {'host': 'proxy.eu.jabber.network', 'port': 1080},
+        'proxy.jabber.ru': {'host': 'proxy.jabber.ru', 'port': 1080},
+        'proxy.jabbim.cz': {'host': 'proxy.jabbim.cz', 'port': 1080},
+        'proxy.yax.im': {'host': 'proxy.yax.im', 'port': 1080},
+    }
+
     def __init__(self, bot):
         super().__init__(bot)
         self.bot.register_handler(
@@ -188,7 +195,13 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
-        self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq))
+        # Identify if this is a response to our proxy offer or a new request
+        query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
+        if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
+             # Initiator notifying us of proxy choice
+             asyncio.create_task(self._socks5_connect_and_save(iq))
+        else:
+             self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq))
 
     async def _socks5_connect_and_save(self, iq, jingle_sid=None):
         sid = None
@@ -205,11 +218,24 @@ class FileTransferPlugin(BasePlugin):
             else:
                 query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
                 if query is None: return
-                sid, hosts, peer_full = query.get('sid'), query.findall('{http://jabber.org/protocol/bytestreams}streamhost'), iq['from'].full
-                if not hosts:
+                sid, peer_full = query.get('sid'), iq['from'].full
+
+                # Check for streamhost-used (Initiator chose one of OUR proxies)
+                used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
+                if used is not None:
+                    jid = used.get('jid')
+                    proxy = self.KNOWN_PROXIES.get(jid)
+                    if proxy:
+                        hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
+                    else:
+                        reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                else:
+                    hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
+
+                if not hosts and used is None:
                     reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                    for p_host, p_jid in [('proxy.jabber.ru', 'proxy.jabber.ru'), ('proxy.eu.jabber.network', 'proxy.eu.jabber.network')]:
-                        ET.SubElement(res_q, 'streamhost', host=p_host, port='1080', jid=p_jid)
+                    for p_jid, p_info in self.KNOWN_PROXIES.items():
+                        ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
                     reply.append(res_q); reply.send(); return
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
@@ -234,9 +260,13 @@ class FileTransferPlugin(BasePlugin):
                         ET.SubElement(res_t, 'candidate-used', cid=host.get('cid'))
                         reply.append(res_j); reply.send()
                     else:
-                        reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                        ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
-                        reply.append(res_q); reply.send()
+                        # Acknowledge streamhost-used or original request
+                        reply = iq.reply()
+                        if used is None:
+                            res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                            ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
+                            reply.append(res_q)
+                        reply.send()
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if not jingle_sid:
