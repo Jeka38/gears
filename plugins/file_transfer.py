@@ -29,6 +29,9 @@ class FileTransferPlugin(BasePlugin):
     def __init__(self, bot):
         super().__init__(bot)
         self.bot.register_handler(
+            handler.Callback('IBB Open', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/ibb}open'), self.handle_ibb_open)
+        )
+        self.bot.register_handler(
             handler.Callback('SI', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'), self.handle_raw_si)
         )
         self.bot.register_handler(
@@ -231,6 +234,7 @@ class FileTransferPlugin(BasePlugin):
 
     async def _socks5_connect_and_save(self, iq, jingle_sid=None):
         sid = None
+        logging.info(f"Starting SOCKS5 connect task for jingle_sid={jingle_sid}")
         try:
             if jingle_sid:
                 sid = jingle_sid; jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
@@ -319,15 +323,49 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
+    def handle_ibb_open(self, iq):
+        ibb = iq.xml.find('{http://jabber.org/protocol/ibb}open')
+        sid = ibb.get('sid')
+        logging.info(f"IBB OPEN request: sid={sid} from {iq['from']}")
+
+        file_info = self.bot.pending_files.get(sid)
+        if not file_info:
+             for s_sid, info in list(self.bot.pending_files.items()):
+                if isinstance(info, dict) and info.get('peer_jid') and info.get('peer_jid').bare == iq['from'].bare:
+                    if info.get('ibb_allowed') and 'fallback' not in str(s_sid):
+                        file_info = info; break
+
+        if file_info and file_info['peer_jid'].bare == iq['from'].bare:
+            logging.info(f"Accepting IBB session: {sid}")
+            iq.reply().send()
+            self.bot['xep_0047']._handle_open(iq) # Trigger slixmpp internal stream creation
+        else:
+            logging.warning(f"Rejecting IBB session: {sid} (not found or unauthorized)")
+            iq.error('item-not-found').send()
+
     def handle_ibb_stream(self, stream):
         sid = stream.sid
+        logging.info(f"IBB Stream Start: sid={sid}, peer={stream.peer_jid}")
         file_info = self.bot.pending_files.get(sid)
+        if not file_info:
+            # Lenient matching for SI fallback with different SID
+            for s_sid, info in list(self.bot.pending_files.items()):
+                if isinstance(info, dict) and info.get('peer_jid') and info.get('peer_jid').bare == stream.peer_jid.bare:
+                    if info.get('ibb_allowed') and 'fallback' not in str(s_sid):
+                        logging.info(f"IBB sid={sid} matched with pending session {s_sid} by JID")
+                        file_info = info
+                        self.bot.pending_files[sid] = file_info
+                        break
+
         if file_info:
             if file_info['peer_jid'].bare != stream.peer_jid.bare:
+                logging.warning(f"IBB peer mismatch: session={file_info['peer_jid'].bare}, stream={stream.peer_jid.bare}")
                 stream.close(); return
-            logging.info(f"IBB stream started for sid={sid}")
+            logging.info(f"IBB stream confirmed for sid={sid}. Starting download task.")
             self.bot.pending_files[f"task_{sid}"] = asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
-        else: stream.close()
+        else:
+            logging.warning(f"IBB stream sid={sid} not recognized. Available SIDs: {list(self.bot.pending_files.keys())}")
+            stream.close()
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
@@ -349,8 +387,16 @@ class FileTransferPlugin(BasePlugin):
             logging.error(f"DOWNLOAD ERROR: {e}")
             if os.path.exists(path): os.remove(path)
         finally:
+            logging.info(f"Cleaning up session sid={sid}")
             info = self.bot.pending_files.get(sid)
             if info:
                 t_sid = info.get('transport_sid')
-                if t_sid and t_sid in self.bot.pending_files: del self.bot.pending_files[t_sid]
+                if t_sid and t_sid in self.bot.pending_files:
+                    logging.info(f"Removing associated transport_sid={t_sid}")
+                    del self.bot.pending_files[t_sid]
             if sid in self.bot.pending_files: del self.bot.pending_files[sid]
+
+            # Additional cleanup for fallback SIDs
+            to_del = [s for s, i in self.bot.pending_files.items() if isinstance(i, dict) and i is info]
+            for s in to_del:
+                 if s in self.bot.pending_files: del self.bot.pending_files[s]
