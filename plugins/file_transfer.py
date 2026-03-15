@@ -106,9 +106,10 @@ class FileTransferPlugin(BasePlugin):
             ibb_t, s5b_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport'), content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             if s5b_t is not None and s5b_t.get('sid'): transport_sid = s5b_t.get('sid')
             elif ibb_t is not None and ibb_t.get('sid'): transport_sid = ibb_t.get('sid')
+            else: transport_sid = sid
             self.bot.pending_files[sid] = {
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
-                'peer_jid': iq['from'], 'ibb_allowed': (ibb_t is not None),
+                'peer_jid': iq['from'], 'ibb_allowed': True,
                 'content_name': content.get('name'), 'content_creator': content.get('creator'),
                 'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
             }
@@ -151,6 +152,25 @@ class FileTransferPlugin(BasePlugin):
                 if transport is not None and not self.bot.pending_files.get(sid, {}).get('s5b_connecting'):
                     self.bot.pending_files[sid]['s5b_connecting'] = True
                     self.bot.pending_files[f"jingle_s5b_info_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+            iq.reply().send()
+        elif action == 'transport-replace':
+            content = jingle.find('{urn:xmpp:jingle:1}content')
+            if content is not None:
+                ibb_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport')
+                if ibb_t is not None:
+                    if sid in self.bot.pending_files:
+                        ibb_sid = ibb_t.get('sid')
+                        self.bot.pending_files[sid]['transport_sid'] = ibb_sid
+                        self.bot.pending_files[ibb_sid] = self.bot.pending_files[sid]
+                        reply = self.bot.make_iq_set(ito=iq['from'])
+                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-accept', 'sid': sid})
+                        res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
+                            'creator': content.get('creator'), 'name': content.get('name')
+                        })
+                        ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'sid': ibb_t.get('sid')})
+                        reply.append(res_j); reply.send()
+            iq.reply().send()
+        elif action == 'transport-accept':
             iq.reply().send()
         elif action == 'session-terminate':
             if sid in self.bot.pending_files: del self.bot.pending_files[sid]
@@ -231,7 +251,15 @@ class FileTransferPlugin(BasePlugin):
                     reply.append(res_q); reply.send(); return
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
-            dst_addr = hashlib.sha1(f"{sid}{peer_full}{self.bot.boundjid.full}".encode()).hexdigest()
+            t_sid = file_info.get('transport_sid', sid)
+            dst_addr = hashlib.sha1(f"{t_sid}{peer_full}{self.bot.boundjid.full}".encode()).hexdigest()
+
+            if jingle_sid and not hosts:
+                jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
+                if jingle is not None and jingle.get('action') == 'session-initiate':
+                    self.bot.pending_files[sid]['s5b_connecting'] = False
+                    return
+
             for host in hosts:
                 try:
                     reader, writer = await asyncio.wait_for(asyncio.open_connection(host.get('host'), int(host.get('port', 1080))), 5)
@@ -262,6 +290,23 @@ class FileTransferPlugin(BasePlugin):
                 except Exception: continue
             if not jingle_sid:
                 reply = iq.reply(); reply['type'] = 'error'; reply.send()
+            elif file_info.get('ibb_allowed'):
+                logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
+                new_ibb_sid = f"fallback_{sid}"
+                self.bot.pending_files[sid]['transport_sid'] = new_ibb_sid
+                self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
+
+                reply = self.bot.make_iq_set(ito=iq['from'])
+                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
+                res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
+                    'creator': file_info.get('content_creator', 'initiator'),
+                    'name': file_info.get('content_name', 'file')
+                })
+                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
+                    'sid': new_ibb_sid, 'block-size': '4096'
+                })
+                reply.append(res_j); reply.send()
+
             if not file_info.get('ibb_allowed'):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
