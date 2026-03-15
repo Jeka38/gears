@@ -88,7 +88,7 @@ class FileTransferPlugin(BasePlugin):
         logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
-                iq.error('not-authorized').send(); return
+                reply = iq.error(); reply['error']['condition'] = 'not-authorized'; reply.send(); return
             content = jingle.find('{urn:xmpp:jingle:1}content')
             if content is None: return
             ft_ns = 'urn:xmpp:jingle:apps:file-transfer:5'
@@ -105,7 +105,8 @@ class FileTransferPlugin(BasePlugin):
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                iq.error('not-allowed', text="Quota exceeded").send(); return
+                reply = iq.error(); reply['error']['condition'] = 'not-allowed'
+                reply['error']['text'] = "Quota exceeded"; reply.send(); return
             ibb_t, s5b_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport'), content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             if s5b_t is not None and s5b_t.get('sid'): transport_sid = s5b_t.get('sid')
             elif ibb_t is not None and ibb_t.get('sid'): transport_sid = ibb_t.get('sid')
@@ -185,14 +186,15 @@ class FileTransferPlugin(BasePlugin):
     def handle_raw_si(self, iq):
         logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
-            return iq.error('not-authorized').send()
+            reply = iq.error(); reply['error']['condition'] = 'not-authorized'; return reply.send()
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                return iq.error('not-allowed', text="Quota exceeded").send()
+                reply = iq.error(); reply['error']['condition'] = 'not-allowed'
+                reply['error']['text'] = "Quota exceeded"; return reply.send()
             feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
             offered_methods = []
             if feature_neg is not None:
@@ -301,7 +303,7 @@ class FileTransferPlugin(BasePlugin):
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if not jingle_sid:
-                iq.error('item-not-found').send()
+                reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send()
             elif file_info.get('ibb_allowed'):
                 logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
                 new_ibb_sid = f"fallback_{sid}"
@@ -341,7 +343,7 @@ class FileTransferPlugin(BasePlugin):
             self.bot['xep_0047']._handle_open(iq) # Trigger slixmpp internal stream creation
         else:
             logging.warning(f"Rejecting IBB session: {sid} (not found or unauthorized)")
-            iq.error('item-not-found').send()
+            reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send()
 
     def handle_ibb_stream(self, stream):
         sid = stream.sid
