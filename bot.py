@@ -100,10 +100,17 @@ class OBBFastBot(ClientXMPP):
             try:
                 await asyncio.sleep(60)
                 now = asyncio.get_event_loop().time()
-                to_delete = [sid for sid, info in self.pending_files.items()
-                             if now - info.get('timestamp', now) > 600]
+                to_delete = []
+                for sid, info in self.pending_files.items():
+                    if isinstance(info, dict):
+                        if now - info.get('timestamp', now) > 600:
+                            to_delete.append(sid)
+                    elif isinstance(info, asyncio.Task):
+                        if info.done():
+                            to_delete.append(sid)
+
                 for sid in to_delete:
-                    logging.info(f"CLEANUP: Expiring pending file sid={sid}")
+                    logging.info(f"CLEANUP: Removing pending item sid={sid}")
                     del self.pending_files[sid]
             except Exception as e:
                 logging.error(f"CLEANUP ERROR: {e}")
