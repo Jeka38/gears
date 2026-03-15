@@ -29,7 +29,7 @@ class FileTransferPlugin(BasePlugin):
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
 
     def handle_http_upload_request(self, iq):
-        logging.info(f"HTTP UPLOAD REQUEST from {iq['from']}")
+        logging.info(f"HTTP UPLOAD REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         request = iq.xml.find('{urn:xmpp:http:upload:0}request')
         fname = os.path.basename(request.get('filename')).replace(' ', '_')
         try: fsize = int(request.get('size', 0))
@@ -49,7 +49,7 @@ class FileTransferPlugin(BasePlugin):
         reply.append(res_slot); reply.send()
 
     def handle_iq_oob(self, iq):
-        logging.info(f"IQ OOB REQUEST from {iq['from']}")
+        logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{jabber:iq:oob}query')
         if query is None: return
         url_tag = query.find('{jabber:iq:oob}url')
@@ -88,7 +88,7 @@ class FileTransferPlugin(BasePlugin):
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
-        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}")
+        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
                 reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
@@ -150,6 +150,7 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
     def handle_raw_si(self, iq):
+        logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
             reply = iq.reply(); reply['type'] = 'error'; return reply.send()
         try:
@@ -186,6 +187,7 @@ class FileTransferPlugin(BasePlugin):
         except Exception as e: logging.error(f"SI ERROR: {e}")
 
     def handle_raw_s5b(self, iq):
+        logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq))
 
     async def _socks5_connect_and_save(self, iq, jingle_sid=None):
