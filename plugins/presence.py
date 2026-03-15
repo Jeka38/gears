@@ -30,6 +30,7 @@ class PresencePlugin(BasePlugin):
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:4')
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:5')
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:transports:s5b:1')
+        self.bot['xep_0030'].add_feature('urn:xmpp:jingle:transports:ibb:1')
         self.bot['xep_0030'].add_feature('jabber:iq:oob')
         self.bot['xep_0030'].add_feature('jabber:x:oob')
         self.bot['xep_0030'].add_feature('urn:xmpp:http:upload:0')

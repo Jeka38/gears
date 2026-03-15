@@ -9,7 +9,6 @@ from slixmpp.xmlstream import ET
 from config import (
     ADMIN_JID, VERSION, APP_NAME, BASE_URL
 )
-from utils import safe_quote
 from database import Database
 from plugins.presence import PresencePlugin
 from plugins.commands import CommandsPlugin
@@ -69,7 +68,6 @@ class OBBFastBot(ClientXMPP):
         peer_jid = file_info['peer_jid']
         user_dir, user_hash = self.get_user_info(peer_jid)
 
-        # Consistent pathing and unique names
         from utils import get_unique_path
         path = get_unique_path(os.path.join(user_dir, os.path.basename(filename).replace(' ', '_')))
 
@@ -81,6 +79,7 @@ class OBBFastBot(ClientXMPP):
                 await asyncio.get_event_loop().run_in_executor(None, os.fsync, f.fileno())
 
             real_fname = os.path.basename(path)
+            from utils import safe_quote
             self.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.base_url}/{user_hash}/{safe_quote(real_fname)}", mtype='chat')
             return web.Response(status=201)
         except Exception as e:
