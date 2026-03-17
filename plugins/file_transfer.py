@@ -141,10 +141,8 @@ class FileTransferPlugin(BasePlugin):
                 elif ibb_t is not None:
                     block_size = ibb_t.get('block-size', '4096')
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': block_size, 'sid': transport_sid})
-                    self.bot['xep_0047'].open_stream(iq['from'], sid=transport_sid, block_size=block_size)
                 else:
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
-                    self.bot['xep_0047'].open_stream(iq['from'], sid=sid, block_size='4096')
 
                 accept_iq.append(res_j); accept_iq.send()
                 if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
@@ -321,9 +319,9 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_ibb_stream_request(self, iq):
         logging.info(f"IBB STREAM REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
-        sid = iq['ibb_open']['sid']
+        sid = iq.xml.find('{http://jabber.org/protocol/ibb}open').get('sid')
         if sid in self.bot.pending_files:
-            self.bot['xep_0047'].accept_stream(iq); return
+            self.bot['xep_0047']._accept_stream(iq); return
 
         # Lenient JID-based correlation for fallback
         peer_bare = iq['from'].bare
@@ -331,7 +329,7 @@ class FileTransferPlugin(BasePlugin):
             if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_bare:
                 logging.info(f"Correlated IBB sid={sid} with pending sid={s_id} for {peer_bare}")
                 self.bot.pending_files[sid] = info
-                self.bot['xep_0047'].accept_stream(iq); return
+                self.bot['xep_0047']._accept_stream(iq); return
 
         logging.warning(f"Rejecting unknown IBB stream sid={sid} from {iq['from']}")
         reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send()
