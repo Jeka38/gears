@@ -20,16 +20,15 @@ class OBBFastBot(ClientXMPP):
         self.dest_dir = dest_dir
         self.base_url = BASE_URL
         self.pending_files = {}
-        asyncio.create_task(self.cleanup_pending_files())
+        self._tasks_started = False
 
         self.db = Database()
         self.migrate_json_to_db()
-        self.migrate_filenames()
 
         # Initialize core features via plugins
         self.register_plugin('xep_0030')
         self.register_plugin('xep_0047')
-        self['xep_0047'].auto_accept = True
+        self['xep_0047'].auto_accept = False
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
@@ -51,6 +50,15 @@ class OBBFastBot(ClientXMPP):
         self.file_transfer = FileTransferPlugin(self)
         self.commands = CommandsPlugin(self)
 
+        self.add_event_handler("session_start", self.on_session_start)
+
+
+    async def on_session_start(self, event):
+        if not self._tasks_started:
+            self._tasks_started = True
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.cleanup_pending_files())
+            loop.create_task(loop.run_in_executor(None, self.migrate_filenames))
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")
@@ -61,7 +69,7 @@ class OBBFastBot(ClientXMPP):
         while True:
             try:
                 await asyncio.sleep(60)
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 to_delete = []
                 for sid, info in self.pending_files.items():
                     if isinstance(info, dict):

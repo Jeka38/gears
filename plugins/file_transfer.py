@@ -41,6 +41,7 @@ class FileTransferPlugin(BasePlugin):
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        self.bot.add_event_handler("ibb_stream_request", self.handle_ibb_stream_request)
 
     def handle_iq_oob(self, iq):
         logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
@@ -59,7 +60,7 @@ class FileTransferPlugin(BasePlugin):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         fname = os.path.basename(fname).replace(' ', '_')
         path = get_unique_path(os.path.join(user_dir, fname))
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=300) as resp:
@@ -85,7 +86,7 @@ class FileTransferPlugin(BasePlugin):
         logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                reply = iq.error(); reply['error']['condition'] = 'not-authorized'; reply.send(); return
             content = jingle.find('{urn:xmpp:jingle:1}content')
             if content is None: return
             ft_ns = 'urn:xmpp:jingle:apps:file-transfer:5'
@@ -102,13 +103,13 @@ class FileTransferPlugin(BasePlugin):
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             ibb_t, s5b_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport'), content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             if s5b_t is not None and s5b_t.get('sid'): transport_sid = s5b_t.get('sid')
             elif ibb_t is not None and ibb_t.get('sid'): transport_sid = ibb_t.get('sid')
             else: transport_sid = sid
             self.bot.pending_files[sid] = {
-                'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
+                'name': fname, 'size': fsize, 'timestamp': asyncio.get_running_loop().time(),
                 'peer_jid': iq['from'], 'ibb_allowed': True,
                 'content_name': content.get('name'), 'content_creator': content.get('creator'),
                 'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
@@ -179,14 +180,14 @@ class FileTransferPlugin(BasePlugin):
     def handle_raw_si(self, iq):
         logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
-            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+            reply = iq.error(); reply['error']['condition'] = 'not-authorized'; reply.send(); return
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
             offered_methods = []
             if feature_neg is not None:
@@ -198,14 +199,14 @@ class FileTransferPlugin(BasePlugin):
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
             chosen_method = next((m for m in ['jabber:iq:oob', 'http://jabber.org/protocol/bytestreams', 'http://jabber.org/protocol/ibb'] if m in offered_methods), None)
             if not chosen_method:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             self.bot.pending_files[sid] = {
-                'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
+                'name': fname, 'size': fsize, 'timestamp': asyncio.get_running_loop().time(),
                 'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
                 'peer_jid': iq['from'], 'transport_sid': sid
             }
             reply = iq.reply()
-            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
+            res_si = ET.Element('{http://jabber.org/protocol/si}si')
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
@@ -241,7 +242,7 @@ class FileTransferPlugin(BasePlugin):
                 if used is not None:
                     jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
                     if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
-                    else: reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                    else: reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send(); return
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
                 if not hosts and used is None:
@@ -289,7 +290,7 @@ class FileTransferPlugin(BasePlugin):
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if not jingle_sid:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send()
+                reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send()
             elif file_info.get('ibb_allowed'):
                 logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
                 new_ibb_sid = f"fallback_{sid}"
@@ -311,6 +312,23 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
+    def handle_ibb_stream_request(self, iq):
+        logging.info(f"IBB STREAM REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        sid = iq['ibb_open']['sid']
+        if sid in self.bot.pending_files:
+            self.bot['xep_0047'].accept_stream(iq); return
+
+        # Lenient JID-based correlation for fallback
+        peer_bare = iq['from'].bare
+        for s_id, info in self.bot.pending_files.items():
+            if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_bare:
+                logging.info(f"Correlated IBB sid={sid} with pending sid={s_id} for {peer_bare}")
+                self.bot.pending_files[sid] = info
+                self.bot['xep_0047'].accept_stream(iq); return
+
+        logging.warning(f"Rejecting unknown IBB stream sid={sid} from {iq['from']}")
+        reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send()
+
     def handle_ibb_stream(self, stream):
         sid = stream.sid
         file_info = self.bot.pending_files.get(sid)
@@ -324,11 +342,11 @@ class FileTransferPlugin(BasePlugin):
     async def download_file_task(self, reader, file_info, peer_jid, sid):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = get_unique_path(os.path.join(user_dir, os.path.basename(file_info['name'])))
-        received, loop = 0, asyncio.get_event_loop()
+        received, loop = 0, asyncio.get_running_loop()
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    if hasattr(reader, 'recv_queue'): chunk = await reader.recv_queue.get()
+                    if hasattr(reader, 'get'): chunk = await reader.get()
                     else: chunk = await reader.read(min(file_info['size'] - received, 1048576))
                     if not chunk: break
                     await loop.run_in_executor(None, f.write, chunk); received += len(chunk)
