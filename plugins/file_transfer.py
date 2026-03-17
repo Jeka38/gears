@@ -327,19 +327,30 @@ class FileTransferPlugin(BasePlugin):
         logging.info(f"IBB OPEN intercepted from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
         sid = open_tag.get('sid') if open_tag is not None else None
+        block_size = int(open_tag.get('block-size', 4096))
 
+        info = None
         if sid and sid in self.bot.pending_files:
-            logging.info(f"Accepting known IBB sid={sid}")
-            await self.bot['xep_0047']._accept_stream(iq); return
+            info = self.bot.pending_files[sid]
+        else:
+            # Lenient JID-based correlation for fallback
+            peer_bare = iq['from'].bare
+            for s_id, p_info in list(self.bot.pending_files.items()):
+                if isinstance(p_info, dict) and p_info.get('peer_jid') and p_info['peer_jid'].bare == peer_bare:
+                    if sid:
+                        logging.info(f"Correlated new IBB sid={sid} with pending sid={s_id} for {peer_bare}")
+                        self.bot.pending_files[sid] = p_info
+                        info = p_info
+                        break
 
-        # Lenient JID-based correlation for fallback
-        peer_bare = iq['from'].bare
-        for s_id, info in list(self.bot.pending_files.items()):
-            if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_bare:
-                if sid:
-                    logging.info(f"Correlated new IBB sid={sid} with pending sid={s_id} for {peer_bare}")
-                    self.bot.pending_files[sid] = info
-                    await self.bot['xep_0047']._accept_stream(iq); return
+        if info:
+            from slixmpp.plugins.xep_0047 import IBBytestream
+            stream = IBBytestream(self.bot, sid, block_size, iq['to'], iq['from'])
+            stream.stream_started = True
+            await self.bot['xep_0047'].api['set_stream'](stream.self_jid, stream.sid, stream.peer_jid, stream)
+            iq.reply().send()
+            self.bot.event('ibb_stream_start', stream)
+            return
 
         logging.warning(f"Unknown IBB stream sid={sid} from {iq['from']}")
 
