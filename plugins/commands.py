@@ -142,9 +142,8 @@ class CommandsPlugin(BasePlugin):
                             if itm.endswith('/'): res.append(f"{i+1} - {display_itm} (директория, {mtime})")
                             else: res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
                     output = "\n" + "\n".join(res)
-                    if mode != 'links':
-                        used = get_dir_size(user_dir)
-                        output += f"\n\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}"
+                    used = get_dir_size(user_dir)
+                    output += f"\n\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}"
                     self.reply(msg, output)
         elif cmd in ('link', 'lnk') and len(parts) == 2:
             cmd_executed = True

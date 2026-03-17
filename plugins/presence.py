@@ -16,6 +16,7 @@ class PresencePlugin(BasePlugin):
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
+        self.bot['xep_0030'].add_feature('http://jabber.org/protocol/iqibb')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:1')
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:apps:file-transfer:4')

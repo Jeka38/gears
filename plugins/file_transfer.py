@@ -209,7 +209,7 @@ class FileTransferPlugin(BasePlugin):
                 'peer_jid': iq['from'], 'transport_sid': sid
             }
             reply = iq.reply()
-            res_si = ET.Element('{http://jabber.org/protocol/si}si')
+            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
