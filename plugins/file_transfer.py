@@ -41,7 +41,10 @@ class FileTransferPlugin(BasePlugin):
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
-        self.bot.add_event_handler("ibb_stream_request", self.handle_ibb_stream_request)
+        # Register handler for IBB open to intercept and correlate before Slixmpp
+        self.bot.register_handler(
+            handler.Callback('IBB Open', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/ibb}open'), self.handle_ibb_open)
+        )
 
     def handle_iq_oob(self, iq):
         logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
@@ -115,7 +118,6 @@ class FileTransferPlugin(BasePlugin):
                 'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
             }
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
-            self.bot['xep_0047']._preauthorize_sid(transport_sid)
             iq.reply().send()
             try:
                 accept_iq = self.bot.make_iq_set(ito=iq['from'])
@@ -209,7 +211,6 @@ class FileTransferPlugin(BasePlugin):
                 'ibb_allowed': True,
                 'peer_jid': iq['from'], 'transport_sid': sid
             }
-            self.bot['xep_0047']._preauthorize_sid(sid)
             reply = iq.reply()
             res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
@@ -303,7 +304,6 @@ class FileTransferPlugin(BasePlugin):
                 new_ibb_sid = f"fallback_{sid}"
                 self.bot.pending_files[sid]['transport_sid'] = new_ibb_sid
                 self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
-                self.bot['xep_0047']._preauthorize_sid(new_ibb_sid)
 
                 reply = self.bot.make_iq_set(ito=iq['from'])
                 res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
@@ -320,31 +320,25 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
-    def handle_ibb_stream_request(self, iq):
-        logging.info(f"IBB STREAM REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
-        try:
-            sid = iq['ibb_open']['sid']
-        except:
-            open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
-            sid = open_tag.get('sid') if open_tag is not None else None
-
-        logging.info(f"Retrieved IBB sid={sid}. Pending SIDs: {list(self.bot.pending_files.keys())}")
+    def handle_ibb_open(self, iq):
+        logging.info(f"IBB OPEN intercepted from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
+        sid = open_tag.get('sid') if open_tag is not None else None
 
         if sid and sid in self.bot.pending_files:
+            logging.info(f"Accepting known IBB sid={sid}")
             self.bot['xep_0047']._accept_stream(iq); return
 
         # Lenient JID-based correlation for fallback
         peer_bare = iq['from'].bare
-        for s_id, info in self.bot.pending_files.items():
+        for s_id, info in list(self.bot.pending_files.items()):
             if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_bare:
-                # If we have a SID mismatch, map the new SID to the existing session info
-                if sid and sid != s_id:
-                    logging.info(f"Correlated IBB sid={sid} with pending sid={s_id} for {peer_bare}")
+                if sid:
+                    logging.info(f"Correlated new IBB sid={sid} with pending sid={s_id} for {peer_bare}")
                     self.bot.pending_files[sid] = info
-                self.bot['xep_0047']._accept_stream(iq); return
+                    self.bot['xep_0047']._accept_stream(iq); return
 
-        logging.warning(f"Rejecting unknown IBB stream sid={sid} from {iq['from']}")
-        reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send()
+        logging.warning(f"Unknown IBB stream sid={sid} from {iq['from']}")
 
     def handle_ibb_stream(self, stream):
         sid = stream.sid
