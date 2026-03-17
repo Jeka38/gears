@@ -43,7 +43,7 @@ class FileTransferPlugin(BasePlugin):
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
         # Register handler for IBB open to intercept and correlate before Slixmpp
         self.bot.register_handler(
-            handler.Callback('IBB Open', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/ibb}open'), self.handle_ibb_open)
+            handler.Callback('IBB Open', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/ibb}open'), self.handle_ibb_open, pos=0)
         )
 
     def handle_iq_oob(self, iq):
@@ -321,38 +321,41 @@ class FileTransferPlugin(BasePlugin):
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
     def handle_ibb_open(self, iq):
-        asyncio.create_task(self._handle_ibb_open_async(iq))
-
-    async def _handle_ibb_open_async(self, iq):
+        # We must intercept synchronously and stop propagation to prevent double replies
         logging.info(f"IBB OPEN intercepted from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
         sid = open_tag.get('sid') if open_tag is not None else None
-        block_size = int(open_tag.get('block-size', 4096))
 
-        info = None
-        if sid and sid in self.bot.pending_files:
-            info = self.bot.pending_files[sid]
-        else:
+        if not sid: return
+
+        info = self.bot.pending_files.get(sid)
+        if not info:
             # Lenient JID-based correlation for fallback
             peer_bare = iq['from'].bare
             for s_id, p_info in list(self.bot.pending_files.items()):
                 if isinstance(p_info, dict) and p_info.get('peer_jid') and p_info['peer_jid'].bare == peer_bare:
-                    if sid:
-                        logging.info(f"Correlated new IBB sid={sid} with pending sid={s_id} for {peer_bare}")
-                        self.bot.pending_files[sid] = p_info
-                        info = p_info
-                        break
+                    logging.info(f"Correlated new IBB sid={sid} with pending sid={s_id} for {peer_bare}")
+                    self.bot.pending_files[sid] = info = p_info
+                    break
 
         if info:
+            asyncio.create_task(self._accept_ibb_async(iq, sid, int(open_tag.get('block-size', 4096))))
+            iq.stop()
+        else:
+            logging.warning(f"Rejecting unknown IBB stream sid={sid} from {iq['from']}")
+            reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send()
+            iq.stop()
+
+    async def _accept_ibb_async(self, iq, sid, block_size):
+        try:
             from slixmpp.plugins.xep_0047 import IBBytestream
             stream = IBBytestream(self.bot, sid, block_size, iq['to'], iq['from'])
             stream.stream_started = True
             await self.bot['xep_0047'].api['set_stream'](stream.self_jid, stream.sid, stream.peer_jid, stream)
             iq.reply().send()
             self.bot.event('ibb_stream_start', stream)
-            return
-
-        logging.warning(f"Unknown IBB stream sid={sid} from {iq['from']}")
+        except Exception as e:
+            logging.error(f"Error in _accept_ibb_async: {e}")
 
     def handle_ibb_stream(self, stream):
         sid = stream.sid
