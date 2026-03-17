@@ -115,6 +115,7 @@ class FileTransferPlugin(BasePlugin):
                 'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
             }
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
+            self.bot['xep_0047']._preauthorize_sid(transport_sid)
             iq.reply().send()
             try:
                 accept_iq = self.bot.make_iq_set(ito=iq['from'])
@@ -205,9 +206,10 @@ class FileTransferPlugin(BasePlugin):
                 reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             self.bot.pending_files[sid] = {
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_running_loop().time(),
-                'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
+                'ibb_allowed': True,
                 'peer_jid': iq['from'], 'transport_sid': sid
             }
+            self.bot['xep_0047']._preauthorize_sid(sid)
             reply = iq.reply()
             res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
@@ -301,6 +303,7 @@ class FileTransferPlugin(BasePlugin):
                 new_ibb_sid = f"fallback_{sid}"
                 self.bot.pending_files[sid]['transport_sid'] = new_ibb_sid
                 self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
+                self.bot['xep_0047']._preauthorize_sid(new_ibb_sid)
 
                 reply = self.bot.make_iq_set(ito=iq['from'])
                 res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
@@ -317,25 +320,6 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
-    def _accept_ibb(self, iq):
-        plugin = self.bot['xep_0047']
-        sid = iq.xml.find('{http://jabber.org/protocol/ibb}open').get('sid')
-        if hasattr(plugin, 'accept_stream'):
-            plugin.accept_stream(iq)
-        else:
-            # Manual acceptance for older Slixmpp
-            iq.reply().send()
-            # Slixmpp 1.8.x: open_stream is a coroutine
-            stream = plugin.open_stream(iq['from'], sid=sid)
-            import inspect
-            if inspect.iscoroutine(stream):
-                async def _task():
-                    s = await stream
-                    self.bot.event("ibb_stream_start", s)
-                asyncio.create_task(_task())
-            else:
-                self.bot.event("ibb_stream_start", stream)
-
     def handle_ibb_stream_request(self, iq):
         logging.info(f"IBB STREAM REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         try:
@@ -347,7 +331,7 @@ class FileTransferPlugin(BasePlugin):
         logging.info(f"Retrieved IBB sid={sid}. Pending SIDs: {list(self.bot.pending_files.keys())}")
 
         if sid and sid in self.bot.pending_files:
-            self._accept_ibb(iq); return
+            self.bot['xep_0047']._accept_stream(iq); return
 
         # Lenient JID-based correlation for fallback
         peer_bare = iq['from'].bare
@@ -357,7 +341,7 @@ class FileTransferPlugin(BasePlugin):
                 if sid and sid != s_id:
                     logging.info(f"Correlated IBB sid={sid} with pending sid={s_id} for {peer_bare}")
                     self.bot.pending_files[sid] = info
-                self._accept_ibb(iq); return
+                self.bot['xep_0047']._accept_stream(iq); return
 
         logging.warning(f"Rejecting unknown IBB stream sid={sid} from {iq['from']}")
         reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send()
