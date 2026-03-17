@@ -320,7 +320,10 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
-    async def handle_ibb_open(self, iq):
+    def handle_ibb_open(self, iq):
+        asyncio.create_task(self._handle_ibb_open_async(iq))
+
+    async def _handle_ibb_open_async(self, iq):
         logging.info(f"IBB OPEN intercepted from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
         sid = open_tag.get('sid') if open_tag is not None else None
