@@ -317,19 +317,47 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
+    def _accept_ibb(self, iq):
+        plugin = self.bot['xep_0047']
+        sid = iq.xml.find('{http://jabber.org/protocol/ibb}open').get('sid')
+        if hasattr(plugin, 'accept_stream'):
+            plugin.accept_stream(iq)
+        else:
+            # Manual acceptance for older Slixmpp
+            iq.reply().send()
+            # Slixmpp 1.8.x: open_stream is a coroutine
+            stream = plugin.open_stream(iq['from'], sid=sid)
+            import inspect
+            if inspect.iscoroutine(stream):
+                async def _task():
+                    s = await stream
+                    self.bot.event("ibb_stream_start", s)
+                asyncio.create_task(_task())
+            else:
+                self.bot.event("ibb_stream_start", stream)
+
     def handle_ibb_stream_request(self, iq):
         logging.info(f"IBB STREAM REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
-        sid = iq.xml.find('{http://jabber.org/protocol/ibb}open').get('sid')
-        if sid in self.bot.pending_files:
-            self.bot['xep_0047']._accept_stream(iq); return
+        try:
+            sid = iq['ibb_open']['sid']
+        except:
+            open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
+            sid = open_tag.get('sid') if open_tag is not None else None
+
+        logging.info(f"Retrieved IBB sid={sid}. Pending SIDs: {list(self.bot.pending_files.keys())}")
+
+        if sid and sid in self.bot.pending_files:
+            self._accept_ibb(iq); return
 
         # Lenient JID-based correlation for fallback
         peer_bare = iq['from'].bare
         for s_id, info in self.bot.pending_files.items():
             if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_bare:
-                logging.info(f"Correlated IBB sid={sid} with pending sid={s_id} for {peer_bare}")
-                self.bot.pending_files[sid] = info
-                self.bot['xep_0047']._accept_stream(iq); return
+                # If we have a SID mismatch, map the new SID to the existing session info
+                if sid and sid != s_id:
+                    logging.info(f"Correlated IBB sid={sid} with pending sid={s_id} for {peer_bare}")
+                    self.bot.pending_files[sid] = info
+                self._accept_ibb(iq); return
 
         logging.warning(f"Rejecting unknown IBB stream sid={sid} from {iq['from']}")
         reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send()

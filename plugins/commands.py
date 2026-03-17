@@ -141,7 +141,11 @@ class CommandsPlugin(BasePlugin):
                             size, mtime = format_size(st.st_size), datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
                             if itm.endswith('/'): res.append(f"{i+1} - {display_itm} (директория, {mtime})")
                             else: res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
-                    self.reply(msg, "\n" + "\n".join(res))
+                    output = "\n" + "\n".join(res)
+                    if mode != 'links':
+                        used = get_dir_size(user_dir)
+                        output += f"\n\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}"
+                    self.reply(msg, output)
         elif cmd in ('link', 'lnk') and len(parts) == 2:
             cmd_executed = True
             items = get_all_items(user_dir)

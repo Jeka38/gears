@@ -53,12 +53,19 @@ class OBBFastBot(ClientXMPP):
         self.add_event_handler("session_start", self.on_session_start)
 
 
+    async def _run_migration(self):
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.migrate_filenames)
+        except Exception as e:
+            logging.error(f"Migration task error: {e}")
+
     async def on_session_start(self, event):
         if not self._tasks_started:
             self._tasks_started = True
             loop = asyncio.get_running_loop()
             loop.create_task(self.cleanup_pending_files())
-            loop.run_in_executor(None, self.migrate_filenames)
+            loop.create_task(self._run_migration())
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")
