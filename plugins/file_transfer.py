@@ -320,14 +320,14 @@ class FileTransferPlugin(BasePlugin):
                 if sid in self.bot.pending_files: del self.bot.pending_files[sid]
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
-    def handle_ibb_open(self, iq):
+    async def handle_ibb_open(self, iq):
         logging.info(f"IBB OPEN intercepted from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         open_tag = iq.xml.find('{http://jabber.org/protocol/ibb}open')
         sid = open_tag.get('sid') if open_tag is not None else None
 
         if sid and sid in self.bot.pending_files:
             logging.info(f"Accepting known IBB sid={sid}")
-            self.bot['xep_0047']._accept_stream(iq); return
+            await self.bot['xep_0047']._accept_stream(iq); return
 
         # Lenient JID-based correlation for fallback
         peer_bare = iq['from'].bare
@@ -336,7 +336,7 @@ class FileTransferPlugin(BasePlugin):
                 if sid:
                     logging.info(f"Correlated new IBB sid={sid} with pending sid={s_id} for {peer_bare}")
                     self.bot.pending_files[sid] = info
-                    self.bot['xep_0047']._accept_stream(iq); return
+                    await self.bot['xep_0047']._accept_stream(iq); return
 
         logging.warning(f"Unknown IBB stream sid={sid} from {iq['from']}")
 
