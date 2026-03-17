@@ -58,7 +58,7 @@ class OBBFastBot(ClientXMPP):
             self._tasks_started = True
             loop = asyncio.get_running_loop()
             loop.create_task(self.cleanup_pending_files())
-            loop.create_task(loop.run_in_executor(None, self.migrate_filenames))
+            loop.run_in_executor(None, self.migrate_filenames)
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")
