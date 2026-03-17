@@ -119,7 +119,9 @@ class FileTransferPlugin(BasePlugin):
             try:
                 accept_iq = self.bot.make_iq_set(ito=iq['from'])
                 res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-accept', 'sid': sid, 'initiator': iq['from'].full})
-                res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': content.get('creator'), 'name': content.get('name')})
+                content_attrs = {'creator': content.get('creator'), 'name': content.get('name')}
+                if content.get('senders'): content_attrs['senders'] = content.get('senders')
+                res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', content_attrs)
                 res_d = ET.SubElement(res_c, f'{{{ft_ns}}}description')
                 res_f = ET.SubElement(res_d, f'{{{ft_ns}}}file')
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname; ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
@@ -137,9 +139,12 @@ class FileTransferPlugin(BasePlugin):
                     for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
                 elif ibb_t is not None:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
+                    block_size = ibb_t.get('block-size', '4096')
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': block_size, 'sid': transport_sid})
+                    self.bot['xep_0047'].open_stream(iq['from'], sid=transport_sid, block_size=block_size)
                 else:
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+                    self.bot['xep_0047'].open_stream(iq['from'], sid=sid, block_size='4096')
 
                 accept_iq.append(res_j); accept_iq.send()
                 if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
@@ -197,7 +202,7 @@ class FileTransferPlugin(BasePlugin):
                     if field is not None:
                         offered_methods = [v.text for v in field.findall('{jabber:x:data}value')]
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
-            chosen_method = next((m for m in ['jabber:iq:oob', 'http://jabber.org/protocol/bytestreams', 'http://jabber.org/protocol/ibb'] if m in offered_methods), None)
+            chosen_method = next((m for m in ['jabber:iq:oob', 'http://jabber.org/protocol/bytestreams', 'http://jabber.org/protocol/ibb', 'http://jabber.org/protocol/iqibb'] if m in offered_methods), None)
             if not chosen_method:
                 reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             self.bot.pending_files[sid] = {
@@ -247,6 +252,8 @@ class FileTransferPlugin(BasePlugin):
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
                 if not hosts and used is None:
                     reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                    local_ip = self.get_local_ip()
+                    ET.SubElement(res_q, 'streamhost', host=local_ip, port='1080', jid=self.bot.boundjid.full)
                     for p_jid, p_info in self.KNOWN_PROXIES.items():
                         ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
                     reply.append(res_q); reply.send(); return
