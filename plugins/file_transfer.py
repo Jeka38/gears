@@ -56,7 +56,10 @@ class FileTransferPlugin(BasePlugin):
 
     async def download_from_url(self, url, fname, peer_jid):
         logging.info(f"Downloading OOB from {url}")
-        if fname.lower().endswith('.php'):
+        import urllib.parse
+        parsed = urllib.parse.urlparse(url)
+        path_name = os.path.basename(parsed.path)
+        if fname.lower().endswith('.php') or path_name.lower().endswith('.php'):
             self.bot.send_message(mto=peer_jid, mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
             return
         user_dir, user_hash = self.bot.get_user_info(peer_jid)

@@ -36,6 +36,21 @@ class CommandsPlugin(BasePlugin):
 
         parts = msg['body'].strip().split()
         if not parts: return
+
+        # Detect and handle direct URLs in message body (HTTP Upload style)
+        if len(parts) == 1 and parts[0].lower().startswith(('http://', 'https://')):
+            url = parts[0]
+            import urllib.parse
+            fname = os.path.basename(urllib.parse.urlparse(url).path) or "downloaded_file"
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
+            except RuntimeError:
+                # Fallback for environments without a running loop (like tests)
+                asyncio.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
+            return
+
         cmd = parts[0].lower()
         user_dir, user_hash = self.bot.get_user_info(msg['from'])
         cmd_executed = False
