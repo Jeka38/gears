@@ -105,7 +105,9 @@ class FileTransferPlugin(BasePlugin):
             if name_tag is None or size_tag is None: return
             if name_tag.text.lower().endswith('.php'):
                 self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                reply = iq.error()
+                reply['error']['condition'] = 'not-acceptable'
+                reply.send(); return
             fname, transport_sid = os.path.basename(name_tag.text).replace(' ', '_'), sid
             try: fsize = int(size_tag.text)
             except: fsize = 0
@@ -194,7 +196,9 @@ class FileTransferPlugin(BasePlugin):
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             if tag.get('name').lower().endswith('.php'):
                 self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                reply = iq.error()
+                reply['error']['condition'] = 'not-acceptable'
+                reply.send(); return
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
