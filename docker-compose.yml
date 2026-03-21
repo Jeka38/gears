@@ -68,3 +68,14 @@ services:
     # (чтобы не было ситуаций, когда веб-сервер уже работает, а файлов ещё нет)
     depends_on:
       - xmpp-bot
+      - php
+
+  # ───────────────────────────────────────────────
+  # Сервис 3: PHP-FPM — для обработки PHP-файлов (режим альбома)
+  # ───────────────────────────────────────────────
+  php:
+    image: php:fpm-alpine
+    container_name: xmpp-php
+    restart: always
+    volumes:
+      - ./downloads:/var/www/html:ro

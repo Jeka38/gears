@@ -158,7 +158,7 @@ class CommandsPlugin(BasePlugin):
                     if mode == 'size':
                         used = get_dir_size(user_dir)
                         res.append(f"\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}")
-                    self.reply(msg, "\n" + "\n".join(res))
+                    self.reply(msg, "\n".join(res))
         elif cmd in ('link', 'lnk') and len(parts) == 2:
             cmd_executed = True
             items = get_all_items(user_dir)
