@@ -13,9 +13,9 @@ def format_size(size):
     return f"{size:.1f} ГБ".replace('.', ',')
 
 def get_dir_size(path):
-    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html"""
+    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html и index.php"""
     return sum(os.path.getsize(os.path.join(d, f))
-               for d, _, fs in os.walk(path) for f in fs if f != 'index.html')
+               for d, _, fs in os.walk(path) for f in fs if f not in ('index.html', 'index.php'))
 
 def safe_quote(text):
     """Красивое кодирование URL (сохраняем кириллицу для читаемости)"""
@@ -93,7 +93,7 @@ def get_all_items(user_dir):
             if path.count(os.sep) < MAX_DIR_DEPTH:
                 items.append(path + "/")
         for f in files:
-            if f == 'index.html':
+            if f in ('index.html', 'index.php'):
                 continue
             path = os.path.join(rel_root, f)
             # Файлы могут находиться в директориях уровня MAX_DIR_DEPTH

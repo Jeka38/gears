@@ -100,7 +100,16 @@ class CommandsPlugin(BasePlugin):
                     if src and os.path.exists(src):
                         try:
                             final_dst = dst
-                            if os.path.isdir(dst): final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                            if os.path.isdir(dst):
+                                final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                            else:
+                                # Если это не директория, то это переименование.
+                                if os.path.isfile(src):
+                                    # Сохраняем расширение исходного файла.
+                                    _, ext = os.path.splitext(src)
+                                    final_dst_base, _ = os.path.splitext(final_dst)
+                                    final_dst = final_dst_base + ext
+
                             rel_dst = os.path.relpath(final_dst, user_dir)
                             is_dir = os.path.isdir(src)
                             limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
@@ -122,9 +131,14 @@ class CommandsPlugin(BasePlugin):
             if mode:
                 cmd_executed = True
                 items = get_all_items(user_dir)
-                if not items: self.reply(msg, "📁 Папка пуста")
+                if not items:
+                    if mode == 'size':
+                        used = get_dir_size(user_dir)
+                        self.reply(msg, f"📁 Папка пуста\n\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}")
+                    else:
+                        self.reply(msg, "📁 Папка пуста")
                 else:
-                    res = []
+                    res = ["Список файлов:"]
                     for i, itm in enumerate(items):
                         depth = itm.count('/')
                         if itm.endswith('/'): depth -= 1
@@ -141,6 +155,9 @@ class CommandsPlugin(BasePlugin):
                             size, mtime = format_size(st.st_size), datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
                             if itm.endswith('/'): res.append(f"{i+1} - {display_itm} (директория, {mtime})")
                             else: res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
+                    if mode == 'size':
+                        used = get_dir_size(user_dir)
+                        res.append(f"\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}")
                     self.reply(msg, "\n" + "\n".join(res))
         elif cmd in ('link', 'lnk') and len(parts) == 2:
             cmd_executed = True
@@ -188,14 +205,29 @@ class CommandsPlugin(BasePlugin):
             cmd_executed = True
             index_path = os.path.join(user_dir, 'index.html')
             if not os.path.exists(index_path):
+                php_path = os.path.join(user_dir, 'index.php')
+                if os.path.exists(php_path): os.remove(php_path)
                 with open(index_path, 'w') as f: f.write("<html><body><h1>Private Archive</h1></body></html>")
-                self.reply(msg, "🔒 Архив теперь приватный (создан index.html)")
+                self.reply(msg, "🔒 Архив теперь приватный (создан index.html, index.php удалён)")
             else: self.reply(msg, "ℹ Архив уже приватный.")
         elif cmd == 'pub' and len(parts) == 1:
             cmd_executed = True
             index_path = os.path.join(user_dir, 'index.html')
-            if os.path.exists(index_path): os.remove(index_path); self.reply(msg, "🔓 Архив теперь публичный (удалён index.html)")
+            php_path = os.path.join(user_dir, 'index.php')
+            if os.path.exists(index_path) or os.path.exists(php_path):
+                if os.path.exists(index_path): os.remove(index_path)
+                if os.path.exists(php_path): os.remove(php_path)
+                self.reply(msg, "🔓 Архив теперь публичный (удалены index.html и index.php)")
             else: self.reply(msg, "ℹ Архив уже публичный.")
+        elif cmd == 'album' and len(parts) == 1:
+            cmd_executed = True
+            php_path = os.path.join(user_dir, 'index.php')
+            if not os.path.exists(php_path):
+                try:
+                    shutil.copy('index.php', php_path)
+                    self.reply(msg, "🖼 Режим альбома активирован (создан index.php)")
+                except Exception as e: self.reply(msg, f"❌ Ошибка при создании альбома: {e}")
+            else: self.reply(msg, "ℹ Режим альбома уже активен.")
 
         # Admin commands
         if not cmd_executed and ADMIN_JID and msg['from'].bare.lower() == ADMIN_JID.lower():
