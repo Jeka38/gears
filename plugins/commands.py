@@ -48,7 +48,7 @@ class CommandsPlugin(BasePlugin):
             url = parts[0]
             path_name = os.path.basename(urllib.parse.urlparse(url).path)
             fname = path_name or "downloaded_file"
-            if fname.lower().endswith('.php'):
+            if self.bot.file_transfer.is_php(fname, path_name):
                 self.reply(msg, "❌ Ошибка: Загрузка PHP-файлов запрещена!")
                 return
             self.bot.loop.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))

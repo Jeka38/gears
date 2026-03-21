@@ -82,19 +82,20 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
         except Exception as e:
             logging.exception(f"OOB Handler Error: {e}")
+            self.send_error(iq, 'internal-server-error')
 
     async def download_from_url(self, url, fname, peer_jid):
         logging.info(f"Downloading OOB from {url}")
-        parsed = urllib.parse.urlparse(url)
-        path_name = os.path.basename(parsed.path)
-        if self.is_php(fname, path_name):
-            self.bot.send_message(mto=peer_jid, mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
-            return
-        user_dir, user_hash = self.bot.get_user_info(peer_jid)
-        fname = os.path.basename(fname).replace(' ', '_')
-        path = get_unique_path(os.path.join(user_dir, fname))
-        loop = asyncio.get_event_loop()
         try:
+            parsed = urllib.parse.urlparse(url)
+            path_name = os.path.basename(parsed.path)
+            if self.is_php(fname, path_name):
+                self.bot.send_message(mto=peer_jid, mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+                return
+            user_dir, user_hash = self.bot.get_user_info(peer_jid)
+            fname = os.path.basename(fname).replace(' ', '_')
+            path = get_unique_path(os.path.join(user_dir, fname))
+            loop = asyncio.get_event_loop()
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=300) as resp:
                     if resp.status == 200:
@@ -110,7 +111,7 @@ class FileTransferPlugin(BasePlugin):
                     else: logging.error(f"OOB download failed: HTTP {resp.status}")
         except Exception as e:
             logging.error(f"OOB download error: {e}")
-            if os.path.exists(path): os.remove(path)
+            if 'path' in locals() and os.path.exists(path): os.remove(path)
 
     def handle_jingle(self, iq):
         if iq['type'] in ('error', 'result'): return
@@ -213,6 +214,7 @@ class FileTransferPlugin(BasePlugin):
                 iq.reply().send()
         except Exception as e:
             logging.exception(f"JINGLE Handler Error: {e}")
+            self.send_error(iq, 'internal-server-error')
 
     def handle_raw_si(self, iq):
         if iq['type'] in ('error', 'result'): return
@@ -241,7 +243,7 @@ class FileTransferPlugin(BasePlugin):
             except: fsize = 0
 
             fname = os.path.basename(fname_raw).replace(' ', '_')
-            user_dir, _ = self.bot.get_user_info(iq['from'])
+            user_dir, user_hash = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 self.send_error(iq, 'resource-constraint', "⚠ Квота превышена!")
                 return
@@ -364,7 +366,7 @@ class FileTransferPlugin(BasePlugin):
                 self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
 
                 reply = self.bot.make_iq_set(ito=iq['from'])
-                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-accept', 'sid': sid})
+                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
                 res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                     'creator': file_info.get('content_creator', 'initiator'),
                     'name': file_info.get('content_name', 'file')
