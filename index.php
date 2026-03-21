@@ -5,7 +5,8 @@ $files = scandir('.');
 echo "<ul>";
 foreach ($files as $file) {
     if ($file != "." && $file != ".." && $file != "index.php" && $file != "index.html") {
-        echo "<li><a href='$file'>$file</a></li>";
+        $safe_file = htmlspecialchars($file);
+        echo "<li><a href='$safe_file'>$safe_file</a></li>";
     }
 }
 echo "</ul>";

@@ -78,4 +78,4 @@ services:
     container_name: xmpp-php
     restart: always
     volumes:
-      - ./downloads:/var/www/html:ro
+      - ./downloads:/var/www/html
