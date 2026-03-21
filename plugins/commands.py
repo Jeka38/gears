@@ -22,12 +22,16 @@ class CommandsPlugin(BasePlugin):
         # Handle XEP-0066 Out-of-Band Data in messages
         oob = msg.xml.find('{jabber:x:oob}x')
         if oob is not None:
-            url = oob.find('{jabber:x:oob}url')
-            if url is not None and url.text:
+            url_tag = oob.find('{jabber:x:oob}url')
+            if url_tag is not None and url_tag.text:
+                url = url_tag.text
                 desc = oob.find('{jabber:x:oob}desc')
-                fname = desc.text if desc is not None and desc.text else os.path.basename(url.text)
-                import asyncio
-                asyncio.create_task(self.bot.file_transfer.download_from_url(url.text, fname, msg['from']))
+                path_name = os.path.basename(urllib.parse.urlparse(url).path)
+                fname = desc.text if desc is not None and desc.text else path_name
+                if self.bot.file_transfer.is_php(fname, path_name):
+                    self.reply(msg, "❌ Ошибка: Загрузка PHP-файлов запрещена!")
+                    return
+                self.bot.loop.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
                 return
 
         if not msg['body']:
