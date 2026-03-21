@@ -47,6 +47,44 @@ class FileTransferPlugin(BasePlugin):
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
         self.bot.add_event_handler("ibb_stream_request", self.handle_ibb_stream_request)
+        self.bot.add_event_handler("session_start", self.on_session_start, disposable=True)
+
+    async def on_session_start(self, event):
+        asyncio.create_task(self.discover_proxies())
+
+    async def discover_proxies(self):
+        logging.info("S5B: Discovering proxies...")
+        try:
+            # Query server for items
+            items = await self.bot['xep_0030'].get_items(jid=self.bot.boundjid.domain)
+            for item in items['disco_items']:
+                try:
+                    info = await self.bot['xep_0030'].get_info(jid=item['jid'])
+                    identities = info['disco_info']['identities']
+                    if any(identity[0] == 'proxy' and identity[1] == 'bytestreams' for identity in identities):
+                        logging.info(f"S5B: Found proxy {item['jid']}")
+                        # Query proxy for streamhosts
+                        res = await self.bot.make_iq_get(ito=item['jid']).append(ET.Element('{http://jabber.org/protocol/bytestreams}query')).send()
+                        query = res.xml.find('{http://jabber.org/protocol/bytestreams}query')
+                        if query is not None:
+                            for sh in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
+                                self.KNOWN_PROXIES[sh.get('jid')] = {'host': sh.get('host'), 'port': int(sh.get('port', 1080))}
+                                logging.info(f"S5B: Added discovered proxy streamhost: {sh.get('jid')} -> {sh.get('host')}:{sh.get('port')}")
+                except Exception as e:
+                    logging.debug(f"S5B: Failed to get info for {item['jid']}: {e}")
+            # Also try the server domain itself, some servers have proxy on the main domain
+            try:
+                info = await self.bot['xep_0030'].get_info(jid=self.bot.boundjid.domain)
+                if any(identity[0] == 'proxy' and identity[1] == 'bytestreams' for identity in info['disco_info']['identities']):
+                     res = await self.bot.make_iq_get(ito=self.bot.boundjid.domain).append(ET.Element('{http://jabber.org/protocol/bytestreams}query')).send()
+                     query = res.xml.find('{http://jabber.org/protocol/bytestreams}query')
+                     if query is not None:
+                         for sh in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
+                             self.KNOWN_PROXIES[sh.get('jid')] = {'host': sh.get('host'), 'port': int(sh.get('port', 1080))}
+                             logging.info(f"S5B: Added discovered server proxy streamhost: {sh.get('jid')} -> {sh.get('host')}:{sh.get('port')}")
+            except: pass
+        except Exception as e:
+            logging.error(f"S5B: Proxy discovery failed: {e}")
 
     def handle_iq_oob(self, iq):
         logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
@@ -94,6 +132,7 @@ class FileTransferPlugin(BasePlugin):
         try:
             raw_data = base64.b64decode(data_tag.text)
             user_dir, _ = self.bot.get_user_info(iq['from'])
+            # Security: Sanitize filename to prevent path traversal
             safe_fname = os.path.basename(fname)
             ext = "png"
             mime = data_tag.get('type')
@@ -174,7 +213,8 @@ class FileTransferPlugin(BasePlugin):
                 ET.SubElement(res_f, f'{{{ft_ns}}}name').text = fname; ET.SubElement(res_f, f'{{{ft_ns}}}size').text = str(fsize)
 
                 if s5b_t is not None:
-                    dst_addr = hashlib.sha1(f"{transport_sid}{initiator}{self.bot.boundjid.full}".encode()).hexdigest()
+                    # Responder providing candidates. dstaddr = SHA-1(SID + ResponderJID + InitiatorJID)
+                    dst_addr = hashlib.sha1(f"{transport_sid}{self.bot.boundjid.full}{initiator}".encode()).hexdigest()
                     res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': transport_sid, 'mode': 'tcp', 'dstaddr': dst_addr})
                     local_ip = self.get_local_ip()
                     ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
@@ -237,7 +277,8 @@ class FileTransferPlugin(BasePlugin):
                         res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                             'creator': content.get('creator'), 'name': content.get('name')
                         })
-                        dst_addr = hashlib.sha1(f"{s5b_sid}{self.bot.pending_files[sid]['initiator']}{self.bot.boundjid.full}".encode()).hexdigest()
+                        # Responder providing candidates. dstaddr = SHA-1(SID + ResponderJID + InitiatorJID)
+                        dst_addr = hashlib.sha1(f"{s5b_sid}{self.bot.boundjid.full}{self.bot.pending_files[sid]['initiator']}".encode()).hexdigest()
                         res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': s5b_sid, 'mode': 'tcp', 'dstaddr': dst_addr})
                         local_ip = self.get_local_ip()
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
@@ -266,7 +307,8 @@ class FileTransferPlugin(BasePlugin):
         file_info['transport_sid'] = s5b_sid
         self.bot.pending_files[s5b_sid] = file_info
 
-        dst_addr = hashlib.sha1(f"{s5b_sid}{file_info['initiator']}{self.bot.boundjid.full}".encode()).hexdigest()
+        # dstaddr = SHA-1(SID + ResponderJID + InitiatorJID)
+        dst_addr = hashlib.sha1(f"{s5b_sid}{self.bot.boundjid.full}{file_info['initiator']}".encode()).hexdigest()
 
         reply = self.bot.make_iq_set(ito=iq['from'])
         res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
@@ -349,7 +391,6 @@ class FileTransferPlugin(BasePlugin):
                 if query is None: return
                 hosts = query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate')
                 peer_full = iq['from'].full
-                peer_is_requester = True
             else:
                 query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
                 if query is None: return
@@ -357,36 +398,39 @@ class FileTransferPlugin(BasePlugin):
                 used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
                 if used is not None:
                     if iq['type'] == 'set':
-                        iq.reply().send(); return
-                    jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
-                    if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
-                    else: reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send(); return
+                        iq.reply().send()
+                        jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
+                        if proxy:
+                             hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
+                             peer_is_requester = False # We offered these, so WE are Requester (must activate)
+                        else: return
+                    else:
+                        jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
+                        if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
+                        else: reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send(); return
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
-
-                if not hosts and used is None:
-                    reply = iq.reply(clear=True)
-                    res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                    hosts_to_connect = []
-                    for p_jid, p_info in self.KNOWN_PROXIES.items():
-                        ET.SubElement(res_q, '{http://jabber.org/protocol/bytestreams}streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
-                        hosts_to_connect.append(ET.Element('streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid))
-                    reply.append(res_q)
-                    logging.info(f"S5B CANDIDATES to {iq['from']}:\n{ET.tostring(reply.xml, encoding='unicode')}")
-                    reply.send()
-                    hosts = hosts_to_connect
-                    peer_is_requester = True
+                    if not hosts:
+                        # Peer asks us for candidates
+                        reply = iq.reply(clear=True)
+                        res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                        hosts = []
+                        for p_jid, p_info in self.KNOWN_PROXIES.items():
+                            sh = ET.SubElement(res_q, '{http://jabber.org/protocol/bytestreams}streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
+                            hosts.append(sh)
+                        reply.append(res_q)
+                        logging.info(f"S5B CANDIDATES to {iq['from']}:\n{ET.tostring(reply.xml, encoding='unicode')}")
+                        reply.send()
+                        peer_is_requester = False # We provided these, so WE are Requester
 
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
             t_sid = file_info.get('transport_sid', sid)
 
             # dstaddr = SHA-1(SID + InitiatorJID + ResponderJID)
-            if jingle_sid:
-                dst_addr = hashlib.sha1(f"{t_sid}{file_info['initiator']}{file_info['responder']}".encode()).hexdigest()
-            else:
-                initiator = file_info.get('initiator', peer_full)
-                dst_addr = hashlib.sha1(f"{t_sid}{initiator}{self.bot.boundjid.full}".encode()).hexdigest()
+            initiator = file_info.get('initiator', peer_full)
+            responder = file_info.get('responder', self.bot.boundjid.full)
+            dst_addr = hashlib.sha1(f"{t_sid}{initiator}{responder}".encode()).hexdigest()
 
             if jingle_sid and not hosts:
                 jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
@@ -417,7 +461,7 @@ class FileTransferPlugin(BasePlugin):
                         ET.SubElement(res_t, 'candidate-used', cid=host.get('cid') or host.get('jid'))
                         reply.append(res_j); reply.send()
                     else:
-                        if iq['type'] == 'get': # We selected their candidate
+                        if iq['type'] == 'get' or (iq['type'] == 'set' and hosts):
                             reply = iq.reply(clear=True)
                             res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
                             ET.SubElement(res_q, '{http://jabber.org/protocol/bytestreams}streamhost-used', jid=host.get('jid'))
@@ -425,12 +469,20 @@ class FileTransferPlugin(BasePlugin):
                             logging.info(f"S5B RESULT to {iq['from']}:\n{ET.tostring(reply.xml, encoding='unicode')}")
                             reply.send()
 
+                        # Traditional Proxy Activation
+                        if not peer_is_requester and host.get('jid') in self.KNOWN_PROXIES:
+                             logging.info(f"S5B: Activating proxy {host.get('jid')} for Peer {peer_full}")
+                             act_iq = self.bot.make_iq_set(ito=host.get('jid'))
+                             act_q = ET.SubElement(act_iq.xml, '{http://jabber.org/protocol/bytestreams}query', sid=t_sid)
+                             ET.SubElement(act_q, 'activate').text = peer_full
+                             await act_iq.send()
+
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception as e:
                     logging.debug(f"S5B: Connection to {host.get('host')} failed: {e}")
                     continue
 
-            if not jingle_sid and iq['type'] == 'get':
+            if not jingle_sid and (iq['type'] == 'get' or (iq['type'] == 'set' and hosts)):
                 reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send()
             elif jingle_sid and file_info.get('ibb_allowed'):
                 logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
@@ -456,18 +508,12 @@ class FileTransferPlugin(BasePlugin):
             if task_key and task_key in self.bot.pending_files: del self.bot.pending_files[task_key]
 
     def handle_ibb_stream_request(self, iq):
-        # We manually accept IBB streams to correlate them with pending files
         sid = iq['ibb_open']['sid']
         file_info = self.bot.pending_files.get(sid)
         if file_info:
              if file_info['peer_jid'].bare == iq['from'].bare:
-                 # It's a match, Slixmpp xep_0047 plugin handles acceptance
-                 # if auto_accept was True, but we set it to False.
-                 # Actually, we need to call accept_stream on the plugin.
                  self.bot['xep_0047'].accept_stream(iq)
                  return
-        # If no match, it will timeout or we can explicitly reject
-        # Slixmpp handles non-accepted streams with error usually.
 
     def handle_ibb_stream(self, stream):
         sid = stream.sid
