@@ -26,6 +26,12 @@ class FileTransferPlugin(BasePlugin):
         'proxy.yax.im': {'host': 'proxy.yax.im', 'port': 1080},
     }
 
+    def is_php(self, *names):
+        for name in names:
+            if name and isinstance(name, str) and name.lower().endswith('.php'):
+                return True
+        return False
+
     def __init__(self, bot):
         super().__init__(bot)
         self.bot.register_handler(
@@ -55,7 +61,7 @@ class FileTransferPlugin(BasePlugin):
         # Immediate PHP check for OOB
         import urllib.parse
         path_name = os.path.basename(urllib.parse.urlparse(url).path)
-        if fname.lower().endswith('.php') or path_name.lower().endswith('.php'):
+        if self.is_php(fname, path_name):
             self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
             reply = iq.error()
             reply['error']['condition'] = 'not-acceptable'
@@ -70,7 +76,7 @@ class FileTransferPlugin(BasePlugin):
         import urllib.parse
         parsed = urllib.parse.urlparse(url)
         path_name = os.path.basename(parsed.path)
-        if fname.lower().endswith('.php') or path_name.lower().endswith('.php'):
+        if self.is_php(fname, path_name):
             self.bot.send_message(mto=peer_jid, mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
             return
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
@@ -99,10 +105,12 @@ class FileTransferPlugin(BasePlugin):
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
-        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                reply = iq.error()
+                reply['error']['condition'] = 'not-authorized'
+                reply.send(); return
             content = jingle.find('{urn:xmpp:jingle:1}content')
             if content is None: return
             ft_ns = 'urn:xmpp:jingle:apps:file-transfer:5'
@@ -114,7 +122,7 @@ class FileTransferPlugin(BasePlugin):
             if file_tag is None: return
             name_tag, size_tag = file_tag.find(f'{{{ft_ns}}}name'), file_tag.find(f'{{{ft_ns}}}size')
             if name_tag is None or size_tag is None: return
-            if name_tag.text.lower().endswith('.php'):
+            if self.is_php(name_tag.text):
                 self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
                 reply = iq.error()
                 reply['error']['condition'] = 'not-acceptable'
@@ -124,7 +132,9 @@ class FileTransferPlugin(BasePlugin):
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                reply = iq.error()
+                reply['error']['condition'] = 'resource-constraint'
+                reply.send(); return
             ibb_t, s5b_t = content.find('{urn:xmpp:jingle:transports:ibb:1}transport'), content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
             if s5b_t is not None and s5b_t.get('sid'): transport_sid = s5b_t.get('sid')
             elif ibb_t is not None and ibb_t.get('sid'): transport_sid = ibb_t.get('sid')
@@ -199,21 +209,34 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
     def handle_raw_si(self, iq):
-        logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        logging.info(f"SI REQUEST from {iq['from']}")
         if not self.bot.is_allowed(iq['from']):
-            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+            reply = iq.error()
+            reply['error']['condition'] = 'not-authorized'
+            reply.send()
+            return
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
-            sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
-            if tag is not None and tag.get('name') and tag.get('name').lower().endswith('.php'):
+            if si is None: return
+            tag = si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+            if tag is None: return
+
+            fname_raw = tag.get('name')
+            if not fname_raw: return
+
+            if self.is_php(fname_raw):
                 self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
                 reply = iq.error()
                 reply['error']['condition'] = 'not-acceptable'
                 reply.send(); return
-            fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
+
+            sid = si.get('id')
+            fname, fsize = os.path.basename(fname_raw).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                reply = iq.error()
+                reply['error']['condition'] = 'resource-constraint'
+                reply.send(); return
             feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
             offered_methods = []
             if feature_neg is not None:
@@ -238,7 +261,13 @@ class FileTransferPlugin(BasePlugin):
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
             ET.SubElement(field, '{jabber:x:data}value').text = chosen_method
             reply.append(res_si); reply.send()
-        except Exception as e: logging.error(f"SI ERROR: {e}")
+        except Exception as e:
+            logging.error(f"SI ERROR: {e}", exc_info=True)
+            try:
+                reply = iq.error()
+                reply['error']['condition'] = 'internal-server-error'
+                reply.send()
+            except: pass
 
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
