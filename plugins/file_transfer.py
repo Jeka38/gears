@@ -4,9 +4,10 @@ import hashlib
 import asyncio
 import logging
 import aiohttp
+import urllib.parse
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
-from utils import get_dir_size, safe_quote, get_unique_path
+from utils import get_dir_size, safe_quote, get_unique_path, is_php_file
 from .base import BasePlugin
 
 class FileTransferPlugin(BasePlugin):
@@ -51,11 +52,19 @@ class FileTransferPlugin(BasePlugin):
         url = url_tag.text
         desc = query.find('{jabber:iq:oob}desc')
         fname = desc.text if desc is not None and desc.text else os.path.basename(url)
+
+        if is_php_file(fname) or is_php_file(urllib.parse.urlparse(url).path):
+            self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+            reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
+
         self.bot.pending_files[f"oob_{url}"] = asyncio.create_task(self.download_from_url(url, fname, iq['from']))
         iq.reply().send()
 
     async def download_from_url(self, url, fname, peer_jid):
         logging.info(f"Downloading OOB from {url}")
+        if is_php_file(fname) or is_php_file(urllib.parse.urlparse(url).path):
+            self.bot.send_message(mto=peer_jid, mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+            return
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         fname = os.path.basename(fname).replace(' ', '_')
         path = get_unique_path(os.path.join(user_dir, fname))
@@ -98,6 +107,9 @@ class FileTransferPlugin(BasePlugin):
             name_tag, size_tag = file_tag.find(f'{{{ft_ns}}}name'), file_tag.find(f'{{{ft_ns}}}size')
             if name_tag is None or size_tag is None: return
             fname, transport_sid = os.path.basename(name_tag.text).replace(' ', '_'), sid
+            if is_php_file(fname):
+                self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             try: fsize = int(size_tag.text)
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
@@ -184,6 +196,9 @@ class FileTransferPlugin(BasePlugin):
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
+            if is_php_file(fname):
+                self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 reply = iq.reply(); reply['type'] = 'error'; return reply.send()

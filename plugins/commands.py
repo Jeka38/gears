@@ -4,7 +4,7 @@ import datetime
 from config import ADMIN_JID, QUOTA_LIMIT_BYTES, MAX_DIR_DEPTH
 from utils import (
     get_dir_size, format_size, get_safe_path, get_all_items,
-    resolve_items_list, resolve_item, get_unique_path, safe_quote
+    resolve_items_list, resolve_item, get_unique_path, safe_quote, is_php_file
 )
 from .base import BasePlugin
 
@@ -86,6 +86,9 @@ class CommandsPlugin(BasePlugin):
                         for src in resolved_srcs:
                             if os.path.abspath(src) == os.path.abspath(dst): continue
                             new_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                            if is_php_file(new_dst):
+                                self.reply(msg, "❌ Ошибка: Переименование в PHP-файл запрещено!")
+                                continue
                             rel_dst = os.path.relpath(new_dst, user_dir)
                             is_dir = os.path.isdir(src)
                             limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1
@@ -101,6 +104,9 @@ class CommandsPlugin(BasePlugin):
                         try:
                             final_dst = dst
                             if os.path.isdir(dst): final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
+                            if is_php_file(final_dst):
+                                self.reply(msg, "❌ Ошибка: Переименование в PHP-файл запрещено!")
+                                return
                             rel_dst = os.path.relpath(final_dst, user_dir)
                             is_dir = os.path.isdir(src)
                             limit = MAX_DIR_DEPTH if not is_dir else MAX_DIR_DEPTH - 1

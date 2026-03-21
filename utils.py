@@ -76,6 +76,11 @@ def resolve_items_list(user_dir, arg, items):
             if path: resolved.append(path)
     return list(dict.fromkeys(resolved))
 
+def is_php_file(filename):
+    """Проверка, является ли файл PHP-скриптом"""
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in ('.php', '.php3', '.php4', '.php5', '.php7', '.phtml')
+
 def get_all_items(user_dir):
     """Получаем все элементы рекурсивно с ограничением вложенности"""
     items = []
