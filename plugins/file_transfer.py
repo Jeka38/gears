@@ -92,6 +92,7 @@ class FileTransferPlugin(BasePlugin):
         try:
             raw_data = base64.b64decode(data_tag.text)
             user_dir, _ = self.bot.get_user_info(iq['from'])
+            # Security: Sanitize filename to prevent path traversal
             safe_fname = os.path.basename(fname)
             ext = "png"
             mime = data_tag.get('type')
@@ -249,15 +250,18 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_raw_si(self, iq):
         logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        if iq['type'] in ('error', 'result'): return
         if not self.bot.is_allowed(iq['from']):
-            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+            reply = iq.error(); reply['error']['condition'] = 'not-authorized'; reply.send(); return
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
+            if si is None: return
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+            if not sid or tag is None: return
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
             offered_methods = []
             if feature_neg is not None:
@@ -269,23 +273,28 @@ class FileTransferPlugin(BasePlugin):
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
             chosen_method = next((m for m in ['jabber:iq:oob', 'http://jabber.org/protocol/bytestreams', 'http://jabber.org/protocol/ibb'] if m in offered_methods), None)
             if not chosen_method:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                reply = iq.error(); reply['error']['condition'] = 'not-acceptable'; reply.send(); return
             self.bot.pending_files[sid] = {
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
                 'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
-                'peer_jid': iq['from'], 'transport_sid': sid
+                'peer_jid': iq['from'], 'transport_sid': sid,
+                'initiator': iq['from'].full
             }
-            reply = iq.reply()
-            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
+            # XEP-0095 result MUST NOT have 'id' or 'profile' attributes in <si/>
+            reply = iq.reply(clear=True)
+            res_si = ET.Element('{http://jabber.org/protocol/si}si')
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
             ET.SubElement(field, '{jabber:x:data}value').text = chosen_method
-            reply.append(res_si); reply.send()
+            reply.append(res_si)
+            logging.info(f"SI RESPONSE to {iq['from']}:\n{ET.tostring(reply.xml, encoding='unicode')}")
+            reply.send()
         except Exception as e: logging.error(f"SI ERROR: {e}")
 
     def handle_raw_s5b(self, iq):
         logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        if iq['type'] in ('error', 'result'): return
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
         if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
              asyncio.create_task(self._socks5_connect_and_save(iq))
@@ -305,27 +314,34 @@ class FileTransferPlugin(BasePlugin):
                 if query is None: return
                 hosts = query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate')
                 peer_full = iq['from'].full
+                peer_is_requester = True # In Jingle FT Responder always connects
             else:
                 query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
                 if query is None: return
                 sid, peer_full = query.get('sid'), iq['from'].full
+                peer_is_requester = True # Traditionally initiator sends streamhosts
                 used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
                 if used is not None:
                     jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
                     if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
-                    else: reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                    else: reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send(); return
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
+
                 if not hosts and used is None:
-                    reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                    # Initiator (Peer) asked us for candidates
+                    reply = iq.reply(clear=True)
+                    res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
                     for p_jid, p_info in self.KNOWN_PROXIES.items():
-                        ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
-                    reply.append(res_q); reply.send(); return
+                        ET.SubElement(res_q, '{http://jabber.org/protocol/bytestreams}streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
+                    reply.append(res_q)
+                    logging.info(f"S5B CANDIDATES to {iq['from']}:\n{ET.tostring(reply.xml, encoding='unicode')}")
+                    reply.send(); return
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
             t_sid = file_info.get('transport_sid', sid)
 
-            # Target (Bot) connecting to Host/Proxy. dstaddr = SHA-1(SID + InitiatorJID + ResponderJID)
+            # Traditional S5B: dstaddr = SHA-1(SID + InitiatorJID + ResponderJID)
             dst_addr = hashlib.sha1(f"{t_sid}{file_info.get('initiator', peer_full)}{self.bot.boundjid.full}".encode()).hexdigest()
 
             if jingle_sid and not hosts:
@@ -354,16 +370,17 @@ class FileTransferPlugin(BasePlugin):
                         ET.SubElement(res_t, 'candidate-used', cid=host.get('cid'))
                         reply.append(res_j); reply.send()
                     else:
-                        reply = iq.reply()
+                        reply = iq.reply(clear=True)
                         if used is None:
                             res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                            ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
+                            ET.SubElement(res_q, '{http://jabber.org/protocol/bytestreams}streamhost-used', jid=host.get('jid'))
                             reply.append(res_q)
+                        logging.info(f"S5B RESULT to {iq['from']}:\n{ET.tostring(reply.xml, encoding='unicode')}")
                         reply.send()
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if not jingle_sid:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send()
+                reply = iq.error(); reply['error']['condition'] = 'item-not-found'; reply.send()
             elif file_info.get('ibb_allowed'):
                 logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
                 new_ibb_sid = f"fallback_{sid}"
