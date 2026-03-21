@@ -3,10 +3,11 @@ import shutil
 import datetime
 import urllib.parse
 import asyncio
+import logging
 from config import ADMIN_JID, QUOTA_LIMIT_BYTES, MAX_DIR_DEPTH
 from utils import (
     get_dir_size, format_size, get_safe_path, get_all_items,
-    resolve_items_list, resolve_item, get_unique_path, safe_quote
+    resolve_items_list, resolve_item, get_unique_path, safe_quote, is_php_file
 )
 from .base import BasePlugin
 
@@ -31,7 +32,7 @@ class CommandsPlugin(BasePlugin):
                 if self.bot.file_transfer.is_php(fname, path_name):
                     self.reply(msg, "❌ Ошибка: Загрузка PHP-файлов запрещена!")
                     return
-                self.bot.loop.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
+                self.bot.pending_files[f"oob_msg_{url}"] = asyncio.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
                 return
 
         if not msg['body']:
@@ -46,12 +47,15 @@ class CommandsPlugin(BasePlugin):
         # Detect and handle direct URLs in message body (HTTP Upload style)
         if len(parts) == 1 and parts[0].lower().startswith(('http://', 'https://')):
             url = parts[0]
-            path_name = os.path.basename(urllib.parse.urlparse(url).path)
-            fname = path_name or "downloaded_file"
-            if self.bot.file_transfer.is_php(fname, path_name):
-                self.reply(msg, "❌ Ошибка: Загрузка PHP-файлов запрещена!")
-                return
-            self.bot.loop.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
+            try:
+                path_name = os.path.basename(urllib.parse.urlparse(url).path)
+                fname = path_name or "downloaded_file"
+                if self.bot.file_transfer.is_php(fname, path_name):
+                    self.reply(msg, "❌ Ошибка: Загрузка PHP-файлов запрещена!")
+                    return
+                self.bot.pending_files[f"url_msg_{url}"] = asyncio.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
+            except Exception as e:
+                logging.error(f"URL download trigger error: {e}")
             return
 
         cmd = parts[0].lower()
@@ -121,12 +125,13 @@ class CommandsPlugin(BasePlugin):
                             if os.path.isdir(dst):
                                 final_dst = os.path.join(dst, os.path.basename(src.rstrip('/')))
                             else:
-                                # Если это не директория, то это переименование.
                                 if os.path.isfile(src):
-                                    # Сохраняем расширение исходного файла.
                                     _, ext = os.path.splitext(src)
                                     final_dst_base, _ = os.path.splitext(final_dst)
                                     final_dst = final_dst_base + ext
+                                    if is_php_file(final_dst):
+                                        self.reply(msg, "❌ Ошибка: Переименование в PHP-файл запрещено!")
+                                        return
 
                             rel_dst = os.path.relpath(final_dst, user_dir)
                             is_dir = os.path.isdir(src)
@@ -242,7 +247,9 @@ class CommandsPlugin(BasePlugin):
             php_path = os.path.join(user_dir, 'index.php')
             if not os.path.exists(php_path):
                 try:
-                    os.chmod(user_dir, 0o777)
+                    # Permissions check and copy
+                    if not os.access(user_dir, os.W_OK):
+                        os.chmod(user_dir, 0o777)
                     shutil.copy('index.php', php_path)
                     self.reply(msg, "🖼 Режим альбома активирован (создан index.php)")
                 except Exception as e: self.reply(msg, f"❌ Ошибка при создании альбома: {e}")

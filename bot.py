@@ -20,16 +20,15 @@ class OBBFastBot(ClientXMPP):
         self.dest_dir = dest_dir
         self.base_url = BASE_URL
         self.pending_files = {}
-        asyncio.create_task(self.cleanup_pending_files())
+        self._tasks_started = False
 
         self.db = Database()
         self.migrate_json_to_db()
-        self.migrate_filenames()
 
         # Initialize core features via plugins
         self.register_plugin('xep_0030')
         self.register_plugin('xep_0047')
-        self['xep_0047'].auto_accept = True
+        self['xep_0047'].auto_accept = False
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
@@ -45,12 +44,19 @@ class OBBFastBot(ClientXMPP):
         self.register_handler(
             handler.Callback('Ping', matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'), self.handle_ping)
         )
+        self.add_event_handler("session_start", self.on_session_start)
 
         # Load logical modules (plugins)
         self.presence = PresencePlugin(self)
         self.file_transfer = FileTransferPlugin(self)
         self.commands = CommandsPlugin(self)
 
+    async def on_session_start(self, event):
+        if not self._tasks_started:
+            self._tasks_started = True
+            asyncio.create_task(self.cleanup_pending_files())
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self.migrate_filenames)
 
     def handle_ping(self, iq):
         logging.info(f"PING RECV from {iq['from']}")
@@ -61,9 +67,11 @@ class OBBFastBot(ClientXMPP):
         while True:
             try:
                 await asyncio.sleep(60)
-                now = asyncio.get_event_loop().time()
+                now = asyncio.get_running_loop().time()
                 to_delete = []
-                for sid, info in self.pending_files.items():
+                for sid in list(self.pending_files.keys()):
+                    info = self.pending_files.get(sid)
+                    if not info: continue
                     if isinstance(info, dict):
                         if now - info.get('timestamp', now) > 600:
                             to_delete.append(sid)
@@ -72,8 +80,9 @@ class OBBFastBot(ClientXMPP):
                             to_delete.append(sid)
 
                 for sid in to_delete:
-                    logging.info(f"CLEANUP: Removing pending item sid={sid}")
-                    del self.pending_files[sid]
+                    if sid in self.pending_files:
+                        logging.info(f"CLEANUP: Removing pending item sid={sid}")
+                        del self.pending_files[sid]
             except Exception as e:
                 logging.error(f"CLEANUP ERROR: {e}")
 

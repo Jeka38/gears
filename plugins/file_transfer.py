@@ -28,9 +28,11 @@ class FileTransferPlugin(BasePlugin):
     }
 
     def is_php(self, *names):
+        blocked = ('.php', '.php3', '.php4', '.php5', '.php7', '.phtml')
         for name in names:
             if name and isinstance(name, str):
-                if name.strip().lower().endswith('.php'):
+                n = name.strip().lower()
+                if any(n.endswith(ext) for ext in blocked):
                     return True
         return False
 
@@ -52,6 +54,7 @@ class FileTransferPlugin(BasePlugin):
 
     def send_error(self, iq, condition, text=None):
         try:
+            if iq['type'] in ('error', 'result'): return
             reply = iq.error()
             reply['error']['condition'] = condition
             if text:
@@ -70,9 +73,8 @@ class FileTransferPlugin(BasePlugin):
             if url_tag is None or not url_tag.text: return
             url = url_tag.text
             desc = query.find('{jabber:iq:oob}desc')
-            fname = desc.text if desc is not None and desc.text else os.path.basename(url)
+            fname = desc.text if desc is not None and desc.text else os.path.basename(urllib.parse.urlparse(url).path)
 
-            # Immediate PHP check for OOB
             path_name = os.path.basename(urllib.parse.urlparse(url).path)
             if self.is_php(fname, path_name):
                 self.send_error(iq, 'not-acceptable', "❌ Ошибка: Загрузка PHP-файлов запрещена!")
@@ -95,7 +97,7 @@ class FileTransferPlugin(BasePlugin):
             user_dir, user_hash = self.bot.get_user_info(peer_jid)
             fname = os.path.basename(fname).replace(' ', '_')
             path = get_unique_path(os.path.join(user_dir, fname))
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=300) as resp:
                     if resp.status == 200:
@@ -134,12 +136,12 @@ class FileTransferPlugin(BasePlugin):
                 file_tag = description.find(f'{{{ft_ns}}}file')
                 if file_tag is None: return
                 name_tag, size_tag = file_tag.find(f'{{{ft_ns}}}name'), file_tag.find(f'{{{ft_ns}}}size')
-                if name_tag is None or size_tag is None: return
+                if name_tag is None: return
                 if self.is_php(name_tag.text):
                     self.send_error(iq, 'not-acceptable', "❌ Ошибка: Загрузка PHP-файлов запрещена!")
                     return
                 fname, transport_sid = os.path.basename(name_tag.text).replace(' ', '_'), sid
-                try: fsize = int(size_tag.text)
+                try: fsize = int(size_tag.text) if size_tag is not None else 0
                 except: fsize = 0
                 user_dir, _ = self.bot.get_user_info(iq['from'])
                 if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
@@ -151,7 +153,7 @@ class FileTransferPlugin(BasePlugin):
                 elif ibb_t is not None and ibb_t.get('sid'): transport_sid = ibb_t.get('sid')
                 else: transport_sid = sid
                 self.bot.pending_files[sid] = {
-                    'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
+                    'name': fname, 'size': fsize, 'timestamp': asyncio.get_running_loop().time(),
                     'peer_jid': iq['from'], 'ibb_allowed': True,
                     'content_name': content.get('name'), 'content_creator': content.get('creator'),
                     'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
@@ -182,7 +184,7 @@ class FileTransferPlugin(BasePlugin):
                     accept_iq.append(res_j); accept_iq.send()
                     if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
                         self.bot.pending_files[sid]['s5b_connecting'] = True
-                        self.bot.pending_files[f"jingle_s5b_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+                        asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
                 except Exception as e: logging.error(f"JINGLE ERROR: {e}")
             elif action == 'transport-info':
                 content = jingle.find('{urn:xmpp:jingle:1}content')
@@ -190,7 +192,7 @@ class FileTransferPlugin(BasePlugin):
                     transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
                     if transport is not None and not self.bot.pending_files.get(sid, {}).get('s5b_connecting'):
                         self.bot.pending_files[sid]['s5b_connecting'] = True
-                        self.bot.pending_files[f"jingle_s5b_info_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+                        asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
                 iq.reply().send()
             elif action == 'transport-replace':
                 content = jingle.find('{urn:xmpp:jingle:1}content')
@@ -261,7 +263,7 @@ class FileTransferPlugin(BasePlugin):
                 self.send_error(iq, 'feature-not-implemented')
                 return
             self.bot.pending_files[sid] = {
-                'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
+                'name': fname, 'size': fsize, 'timestamp': asyncio.get_running_loop().time(),
                 'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
                 'peer_jid': iq['from'], 'transport_sid': sid
             }
