@@ -13,9 +13,15 @@ def format_size(size):
     return f"{size:.1f} ГБ".replace('.', ',')
 
 def get_dir_size(path):
-    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html и index.php"""
-    return sum(os.path.getsize(os.path.join(d, f))
-               for d, _, fs in os.walk(path) for f in fs if f not in ('index.html', 'index.php'))
+    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html, index.php и _sfpg_data"""
+    total = 0
+    for d, dirs, fs in os.walk(path):
+        if '_sfpg_data' in dirs:
+            dirs.remove('_sfpg_data')
+        for f in fs:
+            if f not in ('index.html', 'index.php'):
+                total += os.path.getsize(os.path.join(d, f))
+    return total
 
 def safe_quote(text):
     """Красивое кодирование URL (сохраняем кириллицу для читаемости)"""
@@ -92,6 +98,9 @@ def get_all_items(user_dir):
             path = os.path.join(rel_root, d)
             if path.count(os.sep) < MAX_DIR_DEPTH:
                 items.append(path + "/")
+        if '_sfpg_data' in dirs:
+            dirs.remove('_sfpg_data')
+
         for f in files:
             if f in ('index.html', 'index.php'):
                 continue

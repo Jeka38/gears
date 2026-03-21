@@ -224,6 +224,7 @@ class CommandsPlugin(BasePlugin):
             php_path = os.path.join(user_dir, 'index.php')
             if not os.path.exists(php_path):
                 try:
+                    os.chmod(user_dir, 0o777)
                     shutil.copy('index.php', php_path)
                     self.reply(msg, "🖼 Режим альбома активирован (создан index.php)")
                 except Exception as e: self.reply(msg, f"❌ Ошибка при создании альбома: {e}")
