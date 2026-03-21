@@ -287,6 +287,8 @@ class FileTransferPlugin(BasePlugin):
                     if activated is not None:
                         cid = activated.get('cid')
                         logging.info(f"JINGLE S5B: Candidate {cid} activated")
+                        if sid in self.bot.pending_files and 's5b_activated_event' in self.bot.pending_files[sid]:
+                            self.bot.pending_files[sid]['s5b_activated_event'].set()
             iq.reply().send()
         elif action == 'transport-replace':
             content = jingle.find('{urn:xmpp:jingle:1}content')
@@ -425,13 +427,42 @@ class FileTransferPlugin(BasePlugin):
         file_info = self.bot.pending_files.get(sid)
         if not file_info: return
         t_sid = file_info.get('transport_sid', sid)
-        logging.info(f"JINGLE S5B: Activating proxy {proxy_jid} for {peer_jid}")
-        act_iq = self.bot.make_iq_set(ito=proxy_jid)
-        act_q = ET.SubElement(act_iq.xml, '{http://jabber.org/protocol/bytestreams}query', sid=t_sid)
-        ET.SubElement(act_q, 'activate').text = peer_jid.full
+        proxy_info = self.KNOWN_PROXIES.get(proxy_jid)
+        if not proxy_info: return
+
+        # Jingle S5B dstaddr = SHA1(SID + InitiatorJID + ResponderJID)
+        initiator = file_info.get('initiator')
+        responder = file_info.get('responder')
+        dst_addr = hashlib.sha1(f"{t_sid}{initiator}{responder}".encode()).hexdigest()
+
         try:
+            # 1. Bot MUST connect to proxy first
+            logging.info(f"JINGLE S5B: Connecting to proxy {proxy_jid} ({proxy_info['host']}:{proxy_info['port']})")
+            reader, writer = await asyncio.wait_for(asyncio.open_connection(proxy_info['host'], proxy_info['port']), 10)
+            writer.write(b"\x05\x01\x00"); await writer.drain()
+            if await reader.read(2) != b"\x05\x00":
+                logging.error(f"JINGLE S5B: Proxy {proxy_jid} rejected auth"); writer.close(); return
+
+            logging.info(f"JINGLE S5B: Proxy {proxy_jid} SOCKS5 handshake (dstaddr={dst_addr})")
+            writer.write(b"\x05\x01\x00\x03" + bytes([len(dst_addr)]) + dst_addr.encode() + b"\x00\x00"); await writer.drain()
+            resp = await reader.read(4)
+            if not resp or resp[1] != 0x00:
+                logging.error(f"JINGLE S5B: Proxy {proxy_jid} rejected connection"); writer.close(); return
+
+            # Read remainder of SOCKS5 response
+            atyp = resp[3]
+            if atyp == 0x01: await reader.read(6)
+            elif atyp == 0x03: addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
+            elif atyp == 0x04: await reader.read(18)
+
+            # 2. Only after successful SOCKS5 connect, send activate IQ to proxy
+            logging.info(f"JINGLE S5B: Activating proxy {proxy_jid} for {peer_jid}")
+            act_iq = self.bot.make_iq_set(ito=proxy_jid)
+            act_q = ET.SubElement(act_iq.xml, '{http://jabber.org/protocol/bytestreams}query', sid=t_sid)
+            ET.SubElement(act_q, 'activate').text = peer_jid.full
             await act_iq.send()
-            # Send activated to peer
+
+            # 3. Send activated notification to peer
             reply = self.bot.make_iq_set(ito=peer_jid)
             res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-info', 'sid': sid})
             res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
@@ -441,7 +472,12 @@ class FileTransferPlugin(BasePlugin):
             res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': t_sid})
             ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}activated', cid=hashlib.md5(proxy_jid.encode()).hexdigest())
             reply.append(res_j); reply.send()
-        except Exception as e: logging.error(f"JINGLE S5B: Proxy activation failed: {e}")
+
+            # 4. Start receiving file data
+            await self.download_file_task(reader, file_info, peer_jid, sid)
+            writer.close(); await writer.wait_closed()
+        except Exception as e:
+            logging.error(f"JINGLE S5B: Proxy activation/connection failed: {e}")
 
     async def _socks5_connect_and_save(self, iq, jingle_sid=None, task_key=None):
         sid = None
@@ -497,12 +533,10 @@ class FileTransferPlugin(BasePlugin):
 
             # dstaddr calculation
             if jingle_sid:
-                # Jingle S5B: dstaddr = SHA-1(SID + RequesterJID + TargetJID)
-                if peer_is_requester:
-                    dst_addr = file_info.get('peer_dstaddr') or hashlib.sha1(f"{t_sid}{peer_full}{self.bot.boundjid.full}".encode()).hexdigest()
-                else:
-                    # Bot is Requester
-                    dst_addr = hashlib.sha1(f"{t_sid}{self.bot.boundjid.full}{peer_full}".encode()).hexdigest()
+                # Jingle S5B: dstaddr = SHA-1(SID + InitiatorJID + ResponderJID)
+                initiator = file_info.get('initiator')
+                responder = file_info.get('responder')
+                dst_addr = file_info.get('peer_dstaddr') or hashlib.sha1(f"{t_sid}{initiator}{responder}".encode()).hexdigest()
             else:
                 initiator = file_info.get('initiator', peer_full)
                 responder = file_info.get('responder', self.bot.boundjid.full)
@@ -536,6 +570,17 @@ class FileTransferPlugin(BasePlugin):
                         res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid})
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', cid=host.get('cid') or host.get('jid'))
                         reply.append(res_j); reply.send()
+
+                        # If proxy, wait for 'activated' stanza from peer
+                        if host.get('type') == 'proxy':
+                            logging.info(f"JINGLE S5B: Waiting for activated stanza from {iq['from']}")
+                            if 's5b_activated_event' not in file_info:
+                                file_info['s5b_activated_event'] = asyncio.Event()
+                            try:
+                                await asyncio.wait_for(file_info['s5b_activated_event'].wait(), 30)
+                                logging.info(f"JINGLE S5B: Received activated stanza, proceeding")
+                            except asyncio.TimeoutError:
+                                logging.error(f"JINGLE S5B: Timeout waiting for activated stanza"); writer.close(); continue
                     else:
                         if iq['type'] == 'get' or (iq['type'] == 'set' and hosts):
                             reply = iq.reply(clear=True)
