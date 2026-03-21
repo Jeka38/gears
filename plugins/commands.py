@@ -42,7 +42,11 @@ class CommandsPlugin(BasePlugin):
         # Detect and handle direct URLs in message body (HTTP Upload style)
         if len(parts) == 1 and parts[0].lower().startswith(('http://', 'https://')):
             url = parts[0]
-            fname = os.path.basename(urllib.parse.urlparse(url).path) or "downloaded_file"
+            path_name = os.path.basename(urllib.parse.urlparse(url).path)
+            fname = path_name or "downloaded_file"
+            if fname.lower().endswith('.php'):
+                self.reply(msg, "❌ Ошибка: Загрузка PHP-файлов запрещена!")
+                return
             self.bot.loop.create_task(self.bot.file_transfer.download_from_url(url, fname, msg['from']))
             return
 

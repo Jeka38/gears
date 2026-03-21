@@ -51,6 +51,17 @@ class FileTransferPlugin(BasePlugin):
         url = url_tag.text
         desc = query.find('{jabber:iq:oob}desc')
         fname = desc.text if desc is not None and desc.text else os.path.basename(url)
+
+        # Immediate PHP check for OOB
+        import urllib.parse
+        path_name = os.path.basename(urllib.parse.urlparse(url).path)
+        if fname.lower().endswith('.php') or path_name.lower().endswith('.php'):
+            self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+            reply = iq.error()
+            reply['error']['condition'] = 'not-acceptable'
+            reply.send()
+            return
+
         self.bot.pending_files[f"oob_{url}"] = asyncio.create_task(self.download_from_url(url, fname, iq['from']))
         iq.reply().send()
 
@@ -194,7 +205,7 @@ class FileTransferPlugin(BasePlugin):
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
-            if tag.get('name').lower().endswith('.php'):
+            if tag is not None and tag.get('name') and tag.get('name').lower().endswith('.php'):
                 self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
                 reply = iq.error()
                 reply['error']['condition'] = 'not-acceptable'
@@ -221,7 +232,7 @@ class FileTransferPlugin(BasePlugin):
                 'peer_jid': iq['from'], 'transport_sid': sid
             }
             reply = iq.reply()
-            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
+            res_si = ET.Element('{http://jabber.org/protocol/si}si')
             feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
             x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
