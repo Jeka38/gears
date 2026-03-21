@@ -4,6 +4,7 @@ import hashlib
 import asyncio
 import logging
 import aiohttp
+import urllib.parse
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
 from utils import get_dir_size, safe_quote, get_unique_path
@@ -28,8 +29,9 @@ class FileTransferPlugin(BasePlugin):
 
     def is_php(self, *names):
         for name in names:
-            if name and isinstance(name, str) and name.lower().endswith('.php'):
-                return True
+            if name and isinstance(name, str):
+                if name.strip().lower().endswith('.php'):
+                    return True
         return False
 
     def __init__(self, bot):
@@ -49,7 +51,8 @@ class FileTransferPlugin(BasePlugin):
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
 
     def handle_iq_oob(self, iq):
-        logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        if iq['type'] in ('error', 'result'): return
+        logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{iq}")
         query = iq.xml.find('{jabber:iq:oob}query')
         if query is None: return
         url_tag = query.find('{jabber:iq:oob}url')
@@ -59,7 +62,6 @@ class FileTransferPlugin(BasePlugin):
         fname = desc.text if desc is not None and desc.text else os.path.basename(url)
 
         # Immediate PHP check for OOB
-        import urllib.parse
         path_name = os.path.basename(urllib.parse.urlparse(url).path)
         if self.is_php(fname, path_name):
             self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
@@ -73,7 +75,6 @@ class FileTransferPlugin(BasePlugin):
 
     async def download_from_url(self, url, fname, peer_jid):
         logging.info(f"Downloading OOB from {url}")
-        import urllib.parse
         parsed = urllib.parse.urlparse(url)
         path_name = os.path.basename(parsed.path)
         if self.is_php(fname, path_name):
@@ -102,10 +103,11 @@ class FileTransferPlugin(BasePlugin):
             if os.path.exists(path): os.remove(path)
 
     def handle_jingle(self, iq):
+        if iq['type'] in ('error', 'result'): return
+        logging.info(f"JINGLE REQUEST from {iq['from']}:\n{iq}")
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
-        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
                 reply = iq.error()
@@ -132,6 +134,7 @@ class FileTransferPlugin(BasePlugin):
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                self.bot.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
                 reply = iq.error()
                 reply['error']['condition'] = 'resource-constraint'
                 reply.send(); return
@@ -209,7 +212,8 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
     def handle_raw_si(self, iq):
-        logging.info(f"SI REQUEST from {iq['from']}")
+        if iq['type'] in ('error', 'result'): return
+        logging.info(f"SI REQUEST from {iq['from']}:\n{iq}")
         if not self.bot.is_allowed(iq['from']):
             reply = iq.error()
             reply['error']['condition'] = 'not-authorized'
@@ -234,6 +238,7 @@ class FileTransferPlugin(BasePlugin):
             fname, fsize = os.path.basename(fname_raw).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                self.bot.send_message(mto=iq['from'], mbody="⚠ Квота превышена!", mtype='chat')
                 reply = iq.error()
                 reply['error']['condition'] = 'resource-constraint'
                 reply.send(); return
@@ -248,7 +253,9 @@ class FileTransferPlugin(BasePlugin):
                         offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
             chosen_method = next((m for m in ['jabber:iq:oob', 'http://jabber.org/protocol/bytestreams', 'http://jabber.org/protocol/ibb'] if m in offered_methods), None)
             if not chosen_method:
-                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+                reply = iq.error()
+                reply['error']['condition'] = 'feature-not-implemented'
+                reply.send(); return
             self.bot.pending_files[sid] = {
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
                 'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
@@ -270,7 +277,8 @@ class FileTransferPlugin(BasePlugin):
             except: pass
 
     def handle_raw_s5b(self, iq):
-        logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        if iq['type'] in ('error', 'result'): return
+        logging.info(f"S5B REQUEST from {iq['from']}:\n{iq}")
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
         if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
              asyncio.create_task(self._socks5_connect_and_save(iq))
@@ -297,7 +305,10 @@ class FileTransferPlugin(BasePlugin):
                 if used is not None:
                     jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
                     if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
-                    else: reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                    else:
+                        reply = iq.error()
+                        reply['error']['condition'] = 'item-not-found'
+                        reply.send(); return
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
                 if not hosts and used is None:
