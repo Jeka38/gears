@@ -185,7 +185,8 @@ class FileTransferPlugin(BasePlugin):
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
                 'peer_jid': iq['from'], 'ibb_allowed': True,
                 'content_name': content.get('name'), 'content_creator': content.get('creator'),
-                'ft_ns': ft_ns, 'session_sid': sid, 'transport_sid': transport_sid, 's5b_connecting': False
+                'ft_ns': ft_ns, 'session_sid': sid, 'transport_sid': transport_sid, 's5b_connecting': False,
+                'my_candidates': []
             }
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
             iq.reply().send()
@@ -208,9 +209,12 @@ class FileTransferPlugin(BasePlugin):
 
                     # Proxy candidates
                     for p_jid, p_info in self.proxies.items():
+                        cid = hashlib.md5(p_jid.encode()).hexdigest()
+                        host_info = {'host': p_info['host'], 'port': str(p_info.get('port', 1080)), 'jid': p_jid, 'cid': cid, 'type': 'proxy'}
+                        self.bot.pending_files[sid]['my_candidates'].append(host_info)
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
-                                      host=p_info['host'], port=str(p_info.get('port', 1080)),
-                                      jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(),
+                                      host=host_info['host'], port=host_info['port'],
+                                      jid=host_info['jid'], cid=host_info['cid'],
                                       priority='65536', type='proxy')
                 elif ibb_t is not None:
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
@@ -340,6 +344,12 @@ class FileTransferPlugin(BasePlugin):
                 if used is not None:
                     cid = used.get('cid')
                     candidate = next((c for c in query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate') if c.get('cid') == cid), None)
+                    if candidate is None:
+                        # Check our own candidates if it's one we offered
+                        my_c = next((c for c in file_info.get('my_candidates', []) if c.get('cid') == cid), None)
+                        if my_c:
+                            candidate = ET.Element('candidate', my_c)
+
                     if candidate is not None:
                         hosts = [candidate]
                     else: hosts = []
@@ -396,8 +406,8 @@ class FileTransferPlugin(BasePlugin):
                     elif atyp == 0x03: addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
                     elif atyp == 0x04: await reader.read(18)
 
-                    # Proxy Activation
-                    if host.get('type') == 'proxy' or h_jid in self.proxies:
+                    # Proxy Activation (XEP-0065)
+                    if h_jid in self.proxies:
                         logging.info(f"Activating SOCKS5 proxy: {h_jid}")
                         act_iq = self.bot.make_iq_set(ito=h_jid)
                         query_act = ET.SubElement(act_iq.xml, '{http://jabber.org/protocol/bytestreams}query', {'sid': t_sid})
@@ -406,10 +416,17 @@ class FileTransferPlugin(BasePlugin):
 
                     if jingle_sid:
                         reply = self.bot.make_iq_set(ito=iq['from'])
-                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-info', 'sid': jingle_sid})
-                        res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': file_info.get('content_creator', 'initiator'), 'name': file_info.get('content_name', 'file')})
-                        res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': sid})
-                        ET.SubElement(res_t, 'candidate-used', cid=host.get('cid'))
+                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                            'action': 'transport-info',
+                            'sid': jingle_sid,
+                            'initiator': peer_full
+                        })
+                        res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
+                            'creator': file_info.get('content_creator', 'initiator'),
+                            'name': file_info.get('content_name', 'file')
+                        })
+                        res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': t_sid})
+                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', cid=host.get('cid'))
                         reply.append(res_j); reply.send()
                     else:
                         reply = iq.reply()
@@ -431,7 +448,11 @@ class FileTransferPlugin(BasePlugin):
                 self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
 
                 reply = self.bot.make_iq_set(ito=iq['from'])
-                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-replace', 'sid': sid})
+                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                    'action': 'transport-replace',
+                    'sid': sid,
+                    'initiator': iq['from'].full
+                })
                 res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                     'creator': file_info.get('content_creator', 'initiator'),
                     'name': file_info.get('content_name', 'file')
@@ -475,13 +496,21 @@ class FileTransferPlugin(BasePlugin):
 
                     # session-info (received)
                     info_iq = self.bot.make_iq_set(ito=peer_jid)
-                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-info', 'sid': s_sid})
+                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                        'action': 'session-info',
+                        'sid': s_sid,
+                        'initiator': peer_jid.full
+                    })
                     ET.SubElement(res_j, f'{{{ft_ns}}}received', {'xmlns': ft_ns})
                     info_iq.append(res_j); info_iq.send()
 
                     # session-terminate (success)
                     term_iq = self.bot.make_iq_set(ito=peer_jid)
-                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-terminate', 'sid': s_sid})
+                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                        'action': 'session-terminate',
+                        'sid': s_sid,
+                        'initiator': peer_jid.full
+                    })
                     reason = ET.SubElement(res_j, '{urn:xmpp:jingle:1}reason')
                     ET.SubElement(reason, '{urn:xmpp:jingle:1}success')
                     term_iq.append(res_j); term_iq.send()
