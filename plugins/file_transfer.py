@@ -19,6 +19,13 @@ class FileTransferPlugin(BasePlugin):
             return ip
         except: return '127.0.0.1'
 
+    def is_private_ip(self, ip):
+        try:
+            import ipaddress
+            addr = ipaddress.ip_address(ip)
+            return addr.is_private
+        except: return True
+
     async def discover_proxies(self):
         logging.info("SOCKS5 Proxy Discovery started")
         try:
@@ -308,8 +315,16 @@ class FileTransferPlugin(BasePlugin):
                 if content is None: return
                 query = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
                 if query is None: return
-                hosts = query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate')
-                peer_full = iq['from'].full
+                sid, peer_full = jingle_sid, iq['from'].full
+                used = query.find('{urn:xmpp:jingle:transports:s5b:1}candidate-used')
+                if used is not None:
+                    cid = used.get('cid')
+                    candidate = next((c for c in query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate') if c.get('cid') == cid), None)
+                    if candidate is not None:
+                        hosts = [candidate]
+                    else: hosts = []
+                else:
+                    hosts = query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate')
             else:
                 query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
                 if query is None: return
@@ -337,8 +352,19 @@ class FileTransferPlugin(BasePlugin):
                     self.bot.pending_files[sid]['s5b_connecting'] = False
                     return
 
+            # Sort hosts: proxies first, then public IPs, then private IPs
+            def host_priority(h):
+                h_type = h.get('type', 'host')
+                h_ip = h.get('host')
+                if h_type == 'proxy': return 0
+                if not self.is_private_ip(h_ip): return 1
+                return 2
+
+            hosts = sorted(hosts, key=host_priority)
+
             for host in hosts:
                 try:
+                    h_jid = host.get('jid')
                     reader, writer = await asyncio.wait_for(asyncio.open_connection(host.get('host'), int(host.get('port', 1080))), 5)
                     writer.write(b"\x05\x01\x00"); await writer.drain()
                     if await reader.read(2) != b"\x05\x00": writer.close(); continue
@@ -349,6 +375,15 @@ class FileTransferPlugin(BasePlugin):
                     if atyp == 0x01: await reader.read(6)
                     elif atyp == 0x03: addr_len = await reader.read(1); await reader.read(addr_len[0] + 2)
                     elif atyp == 0x04: await reader.read(18)
+
+                    # Proxy Activation
+                    if host.get('type') == 'proxy' or h_jid in self.proxies:
+                        logging.info(f"Activating SOCKS5 proxy: {h_jid}")
+                        act_iq = self.bot.make_iq_set(ito=h_jid)
+                        query_act = ET.SubElement(act_iq.xml, '{http://jabber.org/protocol/bytestreams}query', {'sid': t_sid})
+                        ET.SubElement(query_act, 'activate').text = peer_full
+                        await act_iq.send()
+
                     if jingle_sid:
                         reply = self.bot.make_iq_set(ito=iq['from'])
                         res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-info', 'sid': jingle_sid})
