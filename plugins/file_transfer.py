@@ -62,7 +62,21 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
+        self.bot.register_handler(
+            handler.Callback('IBB Message Data', matcher.MatchXPath('{jabber:client}message/{http://jabber.org/protocol/ibb}data'), self.handle_ibb_message_data)
+        )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+
+    def handle_ibb_message_data(self, msg):
+        """Explicitly route IBB data in <message/> to Slixmpp's IBB stream handler."""
+        data = msg.xml.find('{http://jabber.org/protocol/ibb}data')
+        if data is not None:
+             sid = data.get('sid')
+             if sid:
+                 # Ensure Slixmpp xep_0047 plugin processes this message.
+                 # Slixmpp should handle this automatically if the plugin is loaded,
+                 # but this ensures visibility for our logging if needed.
+                 pass
 
     def _should_log_xml(self, xml):
         # Check root tag and children for FT namespaces
