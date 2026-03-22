@@ -1,4 +1,5 @@
 import os
+import copy
 import socket
 import hashlib
 import asyncio
@@ -62,21 +63,8 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
-        self.bot.register_handler(
-            handler.Callback('IBB Message Data', matcher.MatchXPath('{jabber:client}message/{http://jabber.org/protocol/ibb}data'), self.handle_ibb_message_data)
-        )
+        # Slixmpp's xep_0047 handles <message/> IBB stanzas automatically if registered.
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
-
-    def handle_ibb_message_data(self, msg):
-        """Explicitly route IBB data in <message/> to Slixmpp's IBB stream handler."""
-        data = msg.xml.find('{http://jabber.org/protocol/ibb}data')
-        if data is not None:
-             sid = data.get('sid')
-             if sid:
-                 # Ensure Slixmpp xep_0047 plugin processes this message.
-                 # Slixmpp should handle this automatically if the plugin is loaded,
-                 # but this ensures visibility for our logging if needed.
-                 pass
 
     def _should_log_xml(self, xml):
         # Check root tag and children for FT namespaces
@@ -104,7 +92,6 @@ class FileTransferPlugin(BasePlugin):
         return has_ft_ns
 
     def _to_log_str(self, xml):
-        import copy
         xml_copy = copy.deepcopy(xml)
         for data in xml_copy.findall('.//{http://jabber.org/protocol/ibb}data'):
             if data.text and len(data.text) > 100:
@@ -120,30 +107,30 @@ class FileTransferPlugin(BasePlugin):
     def handle_xml_in(self, xml):
         if self._should_log_xml(xml):
             logging.info(f"RECV FT XML:\n{self._to_log_str(xml)}")
-            if xml.tag.endswith('}iq') or xml.tag.endswith('}message'):
+            if xml.tag.endswith('}iq'):
                 stanza_id = xml.get('id')
                 if stanza_id:
-                    if xml.get('type') in ('get', 'set', 'chat', 'normal'):
+                    if xml.get('type') in ('get', 'set'):
                         self._tracked_ft_ids.add(stanza_id)
-                    elif xml.get('type') == 'error':
+                    elif xml.get('type') in ('result', 'error'):
                         self._tracked_ft_ids.discard(stanza_id)
-            if xml.tag.endswith('}iq') and xml.get('type') == 'result':
-                iq_id = xml.get('id')
-                if iq_id: self._tracked_ft_ids.discard(iq_id)
+            elif xml.tag.endswith('}message') and xml.get('type') == 'error':
+                stanza_id = xml.get('id')
+                if stanza_id: self._tracked_ft_ids.discard(stanza_id)
 
     def handle_xml_out(self, xml):
         if self._should_log_xml(xml):
             logging.info(f"SENT FT XML:\n{self._to_log_str(xml)}")
-            if xml.tag.endswith('}iq') or xml.tag.endswith('}message'):
+            if xml.tag.endswith('}iq'):
                 stanza_id = xml.get('id')
                 if stanza_id:
-                    if xml.get('type') in ('get', 'set', 'chat', 'normal'):
+                    if xml.get('type') in ('get', 'set'):
                         self._tracked_ft_ids.add(stanza_id)
-                    elif xml.get('type') == 'error':
+                    elif xml.get('type') in ('result', 'error'):
                         self._tracked_ft_ids.discard(stanza_id)
-            if xml.tag.endswith('}iq') and xml.get('type') == 'result':
-                iq_id = xml.get('id')
-                if iq_id: self._tracked_ft_ids.discard(iq_id)
+            elif xml.tag.endswith('}message') and xml.get('type') == 'error':
+                stanza_id = xml.get('id')
+                if stanza_id: self._tracked_ft_ids.discard(stanza_id)
 
     def handle_iq_oob(self, iq):
         query = iq.xml.find('{jabber:iq:oob}query')
