@@ -30,7 +30,6 @@ class OBBFastBot(ClientXMPP):
         self.register_plugin('xep_0030')
         self.register_plugin('xep_0047')
         self['xep_0047'].auto_accept = False
-        self.register_plugin('xep_0166') # Jingle Core
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
@@ -44,7 +43,7 @@ class OBBFastBot(ClientXMPP):
         # Setup custom Ping handler
         from slixmpp.xmlstream import matcher, handler
         self.register_handler(
-            handler.Callback('Ping', matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:ping}ping'), self.handle_ping)
+            handler.Callback('Ping', matcher.MatchXPath('iq/{urn:xmpp:ping}ping'), self.handle_ping)
         )
 
         # Load logical modules (plugins)

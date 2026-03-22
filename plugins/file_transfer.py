@@ -4,10 +4,11 @@ import hashlib
 import asyncio
 import logging
 import aiohttp
+import urllib.parse
 from slixmpp import JID
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
-from utils import get_dir_size, safe_quote, get_unique_path
+from utils import get_dir_size, safe_quote, get_unique_path, is_php_file
 from .base import BasePlugin
 
 class FileTransferPlugin(BasePlugin):
@@ -133,6 +134,9 @@ class FileTransferPlugin(BasePlugin):
 
     async def download_from_url(self, url, fname, peer_jid):
         logging.info(f"Downloading OOB from {url}")
+        if is_php_file(urllib.parse.urlparse(url).path):
+            self.bot.send_message(mto=peer_jid, mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+            return
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         fname = os.path.basename(fname).replace(' ', '_')
         path = get_unique_path(os.path.join(user_dir, fname))
@@ -167,7 +171,14 @@ class FileTransferPlugin(BasePlugin):
             tag = si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
             if tag is None: return
             sid = si.get('id')
-            fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
+            fname = os.path.basename(tag.get('name')).replace(' ', '_')
+            if is_php_file(fname):
+                reply = iq.error()
+                reply['error']['condition'] = 'not-acceptable'
+                reply.send()
+                self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+                return
+            fsize = int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
                 reply = iq.reply(); reply['type'] = 'error'; return reply.send()
@@ -247,7 +258,14 @@ class FileTransferPlugin(BasePlugin):
             if file_tag is None: return
             name_tag, size_tag = file_tag.find(f'{{{ft_ns}}}name'), file_tag.find(f'{{{ft_ns}}}size')
             if name_tag is None or size_tag is None: return
-            fname, transport_sid = os.path.basename(name_tag.text).replace(' ', '_'), sid
+            fname = os.path.basename(name_tag.text).replace(' ', '_')
+            if is_php_file(fname):
+                reply = iq.error()
+                reply['error']['condition'] = 'not-acceptable'
+                reply.send()
+                self.bot.send_message(mto=iq['from'], mbody="❌ Ошибка: Загрузка PHP-файлов запрещена!", mtype='chat')
+                return
+            transport_sid = sid
             try: fsize = int(size_tag.text)
             except: fsize = 0
             user_dir, _ = self.bot.get_user_info(iq['from'])
@@ -460,30 +478,39 @@ class FileTransferPlugin(BasePlugin):
                         reply.send()
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
-            if file_info.get('ibb_allowed'):
-                logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
-                new_ibb_sid = f"fallback_{sid}"
-                self.bot.pending_files[sid]['transport_sid'] = new_ibb_sid
-                self.bot.pending_files[new_ibb_sid] = self.bot.pending_files[sid]
 
-                reply = self.bot.make_iq_set(ito=iq['from'])
-                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
-                    'action': 'transport-replace',
-                    'sid': sid,
-                    'initiator': iq['from'].full,
-                    'responder': self.bot.boundjid.full
-                })
-                res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
-                    'creator': file_info.get('content_creator', 'initiator'),
-                    'name': file_info.get('content_name', 'file')
-                })
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
-                    'sid': new_ibb_sid, 'block-size': '4096'
-                })
-                reply.append(res_j); reply.send()
+            if jingle_sid:
+                if file_info.get('ibb_allowed'):
+                    logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
+                    new_ibb_sid = f"fallback_{sid}"
+                    file_info['transport_sid'] = new_ibb_sid
+                    self.bot.pending_files[new_ibb_sid] = file_info
 
-            if not file_info.get('ibb_allowed'):
-                if sid in self.bot.pending_files: del self.bot.pending_files[sid]
+                    reply = self.bot.make_iq_set(ito=iq['from'])
+                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                        'action': 'transport-replace',
+                        'sid': sid,
+                        'initiator': iq['from'].full,
+                        'responder': self.bot.boundjid.full
+                    })
+                    res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
+                        'creator': file_info.get('content_creator', 'initiator'),
+                        'name': file_info.get('content_name', 'file')
+                    })
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
+                        'sid': new_ibb_sid, 'block-size': '4096'
+                    })
+                    reply.append(res_j); reply.send()
+                else:
+                    self.bot.pending_files.pop(sid, None)
+            else:
+                # SI protocol failure
+                logging.warning(f"SOCKS5 failed for SI sid={sid}")
+                reply = iq.error()
+                reply['error']['condition'] = 'item-not-found'
+                reply.send()
+                if not file_info.get('ibb_allowed'):
+                    self.bot.pending_files.pop(sid, None)
         except Exception as e: logging.error(f"SOCKS5 ERROR: {e}")
 
     def handle_ibb_stream(self, stream):
@@ -548,7 +575,9 @@ class FileTransferPlugin(BasePlugin):
             if os.path.exists(path): os.remove(path)
         finally:
             info = self.bot.pending_files.get(sid)
-            if info:
+            if isinstance(info, dict):
+                s_sid = info.get('session_sid')
                 t_sid = info.get('transport_sid')
-                if t_sid and t_sid in self.bot.pending_files: del self.bot.pending_files[t_sid]
-            if sid in self.bot.pending_files: del self.bot.pending_files[sid]
+                if s_sid: self.bot.pending_files.pop(s_sid, None)
+                if t_sid: self.bot.pending_files.pop(t_sid, None)
+            self.bot.pending_files.pop(sid, None)

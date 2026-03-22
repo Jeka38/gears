@@ -4,7 +4,8 @@ import datetime
 from config import ADMIN_JID, QUOTA_LIMIT_BYTES, MAX_DIR_DEPTH
 from utils import (
     get_dir_size, format_size, get_safe_path, get_all_items,
-    resolve_items_list, resolve_item, get_unique_path, safe_quote
+    resolve_items_list, resolve_item, get_unique_path, safe_quote,
+    is_php_file
 )
 from .base import BasePlugin
 
@@ -73,6 +74,9 @@ class CommandsPlugin(BasePlugin):
             else: self.reply(msg, "❌ Директории не найдены или не пусты")
         elif cmd == 'mv' and len(parts) == 3:
             cmd_executed = True
+            if is_php_file(parts[2]):
+                 self.reply(msg, "❌ Ошибка: Переименование в PHP-файл запрещено!")
+                 return
             items = get_all_items(user_dir)
             dst = resolve_item(user_dir, parts[2], items)
             if not dst: self.reply(msg, "❌ Недопустимый путь назначения")

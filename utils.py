@@ -3,6 +3,11 @@ import urllib.parse
 import fnmatch
 from config import MAX_DIR_DEPTH
 
+def is_php_file(filename):
+    """Проверяет, является ли файл PHP-скриптом"""
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in ('.php', '.php3', '.php4', '.php5', '.php7', '.phtml')
+
 def format_size(size):
     """Форматирует размер в человеко-читаемый вид (Б → кБ → МБ → ГБ)"""
     for unit in ['Б', 'кБ', 'МБ', 'ГБ']:
@@ -13,9 +18,15 @@ def format_size(size):
     return f"{size:.1f} ГБ".replace('.', ',')
 
 def get_dir_size(path):
-    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html"""
-    return sum(os.path.getsize(os.path.join(d, f))
-               for d, _, fs in os.walk(path) for f in fs if f != 'index.html')
+    """Подсчитывает суммарный размер всех файлов в папке (рекурсивно), исключая index.html, index.php и _sfpg_data"""
+    total = 0
+    for d, dirs, fs in os.walk(path):
+        if '_sfpg_data' in dirs:
+            dirs.remove('_sfpg_data')
+        for f in fs:
+            if f not in ('index.html', 'index.php'):
+                total += os.path.getsize(os.path.join(d, f))
+    return total
 
 def safe_quote(text):
     """Красивое кодирование URL (сохраняем кириллицу для читаемости)"""
