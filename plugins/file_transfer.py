@@ -65,14 +65,6 @@ class FileTransferPlugin(BasePlugin):
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
 
     def _should_log_xml(self, xml):
-        # Ignore IBB data stanzas (both as root and as child of <message>)
-        if xml.tag.endswith('}data') and 'http://jabber.org/protocol/ibb' in xml.tag:
-            return False
-        if xml.tag.endswith('}message') and xml.find('{http://jabber.org/protocol/ibb}data') is not None:
-            return False
-        if xml.tag.endswith('}iq') and xml.find('{http://jabber.org/protocol/ibb}data') is not None:
-            return False
-
         # Check root tag and children for FT namespaces
         has_ft_ns = False
         for prefix in self._ft_ns_prefixes:
@@ -100,9 +92,23 @@ class FileTransferPlugin(BasePlugin):
 
         return has_ft_ns
 
+    def _to_log_str(self, xml):
+        import copy
+        xml_copy = copy.deepcopy(xml)
+        for data in xml_copy.findall('.//{http://jabber.org/protocol/ibb}data'):
+            if data.text and len(data.text) > 100:
+                data.text = data.text[:50] + f"...[TRUNCATED {len(data.text)} bytes]..." + data.text[-10:]
+        for data in xml_copy.findall('.//{urn:xmpp:bob}data'):
+            if data.text and len(data.text) > 100:
+                data.text = data.text[:50] + f"...[TRUNCATED {len(data.text)} bytes]..." + data.text[-10:]
+        if xml_copy.tag.endswith('}data') and ('http://jabber.org/protocol/ibb' in xml_copy.tag or 'urn:xmpp:bob' in xml_copy.tag):
+             if xml_copy.text and len(xml_copy.text) > 100:
+                xml_copy.text = xml_copy.text[:50] + f"...[TRUNCATED {len(xml_copy.text)} bytes]..." + xml_copy.text[-10:]
+        return ET.tostring(xml_copy, encoding='unicode')
+
     def handle_xml_in(self, xml):
         if self._should_log_xml(xml):
-            logging.info(f"RECV FT XML:\n{ET.tostring(xml, encoding='unicode')}")
+            logging.info(f"RECV FT XML:\n{self._to_log_str(xml)}")
             if xml.tag.endswith('}iq'):
                 iq_id = xml.get('id')
                 if iq_id:
@@ -113,7 +119,7 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_xml_out(self, xml):
         if self._should_log_xml(xml):
-            logging.info(f"SENT FT XML:\n{ET.tostring(xml, encoding='unicode')}")
+            logging.info(f"SENT FT XML:\n{self._to_log_str(xml)}")
             if xml.tag.endswith('}iq'):
                 iq_id = xml.get('id')
                 if iq_id:
