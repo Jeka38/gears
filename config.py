@@ -25,6 +25,7 @@ XMPP_RESOURCE = os.getenv('XMPP_RESOURCE')
 XMPP_PASSWORD = os.getenv('XMPP_PASSWORD')
 XMPP_HOST = os.getenv('XMPP_HOST', 'jabberworld.info')
 XMPP_PORT = int(os.getenv('XMPP_PORT', 5222))
+SOCKS5_PORT = int(os.getenv('SOCKS5_PORT', 1080))
 
 # Bot appearance and metadata
 APP_NAME = os.getenv('APP_NAME', 'OBBFastBot')

@@ -5,7 +5,7 @@ import asyncio
 import logging
 import aiohttp
 from slixmpp.xmlstream import ET, matcher, handler
-from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
+from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES, SOCKS5_PORT
 from utils import get_dir_size, safe_quote, get_unique_path
 from .base import BasePlugin
 
@@ -20,10 +20,10 @@ class FileTransferPlugin(BasePlugin):
         except: return '127.0.0.1'
 
     KNOWN_PROXIES = {
-        'proxy.eu.jabber.network': {'host': 'proxy.eu.jabber.network', 'port': 1080},
-        'proxy.jabber.ru': {'host': 'proxy.jabber.ru', 'port': 1080},
-        'proxy.jabbim.cz': {'host': 'proxy.jabbim.cz', 'port': 1080},
-        'proxy.yax.im': {'host': 'proxy.yax.im', 'port': 1080},
+        'proxy.eu.jabber.network': {'host': 'proxy.eu.jabber.network', 'port': SOCKS5_PORT},
+        'proxy.jabber.ru': {'host': 'proxy.jabber.ru', 'port': SOCKS5_PORT},
+        'proxy.jabbim.cz': {'host': 'proxy.jabbim.cz', 'port': SOCKS5_PORT},
+        'proxy.yax.im': {'host': 'proxy.yax.im', 'port': SOCKS5_PORT},
     }
 
     def __init__(self, bot):
@@ -135,12 +135,12 @@ class FileTransferPlugin(BasePlugin):
                     # Direct candidate
                     local_ip = self.get_local_ip()
                     ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
-                                  host=local_ip, port='1080', jid=self.bot.boundjid.full,
+                                  host=local_ip, port=str(SOCKS5_PORT), jid=self.bot.boundjid.full,
                                   cid='direct-host', priority='8253074', type='host')
 
                     # Proxy candidates
                     for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
-                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
+                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port=str(SOCKS5_PORT), jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
                 elif ibb_t is not None:
                     block_size = ibb_t.get('block-size', '4096')
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': block_size, 'sid': transport_sid})
@@ -254,7 +254,7 @@ class FileTransferPlugin(BasePlugin):
                 if not hosts and used is None:
                     reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
                     local_ip = self.get_local_ip()
-                    ET.SubElement(res_q, 'streamhost', host=local_ip, port='1080', jid=self.bot.boundjid.full)
+                    ET.SubElement(res_q, 'streamhost', host=local_ip, port=str(SOCKS5_PORT), jid=self.bot.boundjid.full)
                     for p_jid, p_info in self.KNOWN_PROXIES.items():
                         ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
                     reply.append(res_q); reply.send(); return
@@ -272,7 +272,7 @@ class FileTransferPlugin(BasePlugin):
 
             for host in hosts:
                 try:
-                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host.get('host'), int(host.get('port', 1080))), 5)
+                    reader, writer = await asyncio.wait_for(asyncio.open_connection(host.get('host'), int(host.get('port', SOCKS5_PORT))), 5)
                     writer.write(b"\x05\x01\x00"); await writer.drain()
                     if await reader.read(2) != b"\x05\x00": writer.close(); continue
                     writer.write(b"\x05\x01\x00\x03" + bytes([len(dst_addr)]) + dst_addr.encode() + b"\x00\x00"); await writer.drain()
@@ -375,7 +375,7 @@ class FileTransferPlugin(BasePlugin):
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    if hasattr(reader, 'get'): chunk = await reader.get()
+                    if hasattr(reader, 'recv_queue'): chunk = await reader.recv_queue.get()
                     else: chunk = await reader.read(min(file_info['size'] - received, 1048576))
                     if not chunk: break
                     await loop.run_in_executor(None, f.write, chunk); received += len(chunk)
