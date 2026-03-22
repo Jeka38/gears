@@ -309,6 +309,11 @@ class FileTransferPlugin(BasePlugin):
         elif action == 'transport-accept':
             iq.reply().send()
         elif action == 'session-terminate':
+            task_key = f"task_{sid}"
+            if task_key in self.bot.pending_files:
+                task = self.bot.pending_files[task_key]
+                if isinstance(task, asyncio.Task) and not task.done():
+                    task.cancel()
             if sid in self.bot.pending_files: del self.bot.pending_files[sid]
             iq.reply().send()
 
@@ -476,19 +481,23 @@ class FileTransferPlugin(BasePlugin):
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
-                    if hasattr(reader, 'recv_queue'): chunk = await reader.recv_queue.get()
-                    else: chunk = await reader.read(min(file_info['size'] - received, 1048576))
-                    if not chunk: break
-                    await loop.run_in_executor(None, f.write, chunk); received += len(chunk)
+                    try:
+                        if hasattr(reader, 'recv_queue'): chunk = await reader.recv_queue.get()
+                        else: chunk = await reader.read(min(file_info['size'] - received, 1048576))
+                        if not chunk: break
+                        await loop.run_in_executor(None, f.write, chunk); received += len(chunk)
+                    except (asyncio.CancelledError, Exception):
+                        raise
                 await loop.run_in_executor(None, f.flush); await loop.run_in_executor(None, os.fsync, f.fileno())
+
             if received == file_info['size']:
                 logging.info(f"DOWNLOAD COMPLETE: sid={sid}, path={path}")
                 self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(os.path.basename(path))}", mtype='chat')
             else:
                 logging.error(f"DOWNLOAD INCOMPLETE: sid={sid}, received {received}/{file_info['size']}")
                 if os.path.exists(path): os.remove(path)
-        except Exception as e:
-            logging.error(f"DOWNLOAD ERROR: sid={sid}, error={e}")
+        except (asyncio.CancelledError, Exception) as e:
+            logging.error(f"DOWNLOAD {'CANCELLED' if isinstance(e, asyncio.CancelledError) else 'ERROR'}: sid={sid}, error={e}")
             if os.path.exists(path): os.remove(path)
         finally:
             info = self.bot.pending_files.get(sid)

@@ -124,7 +124,7 @@ class CommandsPlugin(BasePlugin):
                 items = get_all_items(user_dir)
                 if not items: self.reply(msg, "📁 Папка пуста")
                 else:
-                    res = []
+                    res = ["Список файлов:"]
                     for i, itm in enumerate(items):
                         depth = itm.count('/')
                         if itm.endswith('/'): depth -= 1
@@ -141,7 +141,13 @@ class CommandsPlugin(BasePlugin):
                             size, mtime = format_size(st.st_size), datetime.datetime.fromtimestamp(st.st_mtime).strftime('%Y-%m-%d %H:%M')
                             if itm.endswith('/'): res.append(f"{i+1} - {display_itm} (директория, {mtime})")
                             else: res.append(f"{i+1} - {display_itm} ({size}, загружен {mtime})")
-                    self.reply(msg, "\n" + "\n".join(res))
+
+                    footer = ""
+                    if mode == 'size':
+                        used = get_dir_size(user_dir)
+                        footer = f"\n\n📊 Квота: {format_size(used)} / {format_size(QUOTA_LIMIT_BYTES)}"
+
+                    self.reply(msg, "\n".join(res) + footer)
         elif cmd in ('link', 'lnk') and len(parts) == 2:
             cmd_executed = True
             items = get_all_items(user_dir)
