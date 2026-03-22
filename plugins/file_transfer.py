@@ -41,15 +41,15 @@ class FileTransferPlugin(BasePlugin):
                     # Step 2: Query info for each item
                     info = await self.bot['xep_0030'].get_info(jid=target_jid)
                     # Step 3: Check for SOCKS5 bytestreams feature
-                    if 'http://jabber.org/protocol/bytestreams' in info['disco_info']['features']:
+                    features = info.xml.find('{http://jabber.org/protocol/disco#info}query').findall('{http://jabber.org/protocol/disco#info}feature')
+                    if any(f.get('var') == 'http://jabber.org/protocol/bytestreams' for f in features):
                         # Step 4: Query the proxy for its host/port
                         iq = self.bot.make_iq_get(ito=target_jid)
                         iq.append(ET.Element('{http://jabber.org/protocol/bytestreams}query'))
                         res = await iq.send()
                         query = res.xml.find('{http://jabber.org/protocol/bytestreams}query')
                         if query is not None:
-                            streamhost = query.find('{http://jabber.org/protocol/bytestreams}streamhost')
-                            if streamhost is not None:
+                            for streamhost in query.findall('{http://jabber.org/protocol/bytestreams}streamhost'):
                                 host, port = streamhost.get('host'), streamhost.get('port', '1080')
                                 self.proxies[target_jid] = {'host': host, 'port': port}
                                 logging.info(f"DISCOVERED PROXY: {target_jid} -> {host}:{port}")
@@ -292,7 +292,23 @@ class FileTransferPlugin(BasePlugin):
             field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
             ET.SubElement(field, '{jabber:x:data}value').text = chosen_method
             reply.append(res_si); reply.send()
+
+            # Proactively offer our discovered proxies to the initiator
+            if chosen_method == 'http://jabber.org/protocol/bytestreams' and self.proxies:
+                asyncio.create_task(self._offer_proxies_to_initiator(iq['from'], sid))
+
         except Exception as e: logging.error(f"SI ERROR: {e}")
+
+    async def _offer_proxies_to_initiator(self, peer_jid, sid):
+        try:
+            logging.info(f"Proactively offering proxies to SI initiator {peer_jid}")
+            offer_iq = self.bot.make_iq_set(ito=peer_jid)
+            query = ET.SubElement(offer_iq.xml, '{http://jabber.org/protocol/bytestreams}query', {'sid': sid, 'mode': 'tcp'})
+            for p_jid, p_info in self.proxies.items():
+                ET.SubElement(query, 'streamhost', host=p_info['host'], port=str(p_info.get('port', 1080)), jid=p_jid)
+            await offer_iq.send()
+        except Exception as e:
+            logging.error(f"Error offering proxies to SI initiator: {e}")
 
     def handle_raw_s5b(self, iq):
         if iq['type'] in ('error', 'result'): return
