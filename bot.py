@@ -28,8 +28,6 @@ class OBBFastBot(ClientXMPP):
 
         # Initialize core features via plugins
         self.register_plugin('xep_0030')
-        self.register_plugin('xep_0047')
-        self['xep_0047'].auto_accept = True
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
@@ -156,3 +154,6 @@ class OBBFastBot(ClientXMPP):
                 "list - показать белый и чёрный списки."
             )
         return text
+
+    def make_iq_set(self, ito=None):
+        return self.make_iq(itype='set', ito=ito)
