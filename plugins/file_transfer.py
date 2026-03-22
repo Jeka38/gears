@@ -65,8 +65,12 @@ class FileTransferPlugin(BasePlugin):
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
 
     def _should_log_xml(self, xml):
-        # Ignore IBB data stanzas
+        # Ignore IBB data stanzas (both as root and as child of <message>)
         if xml.tag.endswith('}data') and 'http://jabber.org/protocol/ibb' in xml.tag:
+            return False
+        if xml.tag.endswith('}message') and xml.find('{http://jabber.org/protocol/ibb}data') is not None:
+            return False
+        if xml.tag.endswith('}iq') and xml.find('{http://jabber.org/protocol/ibb}data') is not None:
             return False
 
         # Check root tag and children for FT namespaces
@@ -186,7 +190,8 @@ class FileTransferPlugin(BasePlugin):
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
                 'peer_jid': iq['from'], 'ibb_allowed': True,
                 'content_name': content.get('name'), 'content_creator': content.get('creator'),
-                'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
+                'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False,
+                'ibb_stanzas': ibb_t.get('stanzas') if ibb_t is not None else None
             }
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
             iq.reply().send()
@@ -211,7 +216,9 @@ class FileTransferPlugin(BasePlugin):
                     for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
                 elif ibb_t is not None:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
+                    ibb_attrs = {'block-size': '4096', 'sid': transport_sid}
+                    if ibb_t.get('stanzas'): ibb_attrs['stanzas'] = ibb_t.get('stanzas')
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', ibb_attrs)
                 else:
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
 
@@ -236,13 +243,16 @@ class FileTransferPlugin(BasePlugin):
                     if sid in self.bot.pending_files:
                         ibb_sid = ibb_t.get('sid')
                         self.bot.pending_files[sid]['transport_sid'] = ibb_sid
+                        self.bot.pending_files[sid]['ibb_stanzas'] = ibb_t.get('stanzas')
                         self.bot.pending_files[ibb_sid] = self.bot.pending_files[sid]
                         reply = self.bot.make_iq_set(ito=iq['from'])
                         res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-accept', 'sid': sid})
                         res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                             'creator': content.get('creator'), 'name': content.get('name')
                         })
-                        ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'sid': ibb_t.get('sid')})
+                        ibb_attrs = {'sid': ibb_sid}
+                        if ibb_t.get('stanzas'): ibb_attrs['stanzas'] = ibb_t.get('stanzas')
+                        ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', ibb_attrs)
                         reply.append(res_j); reply.send()
             iq.reply().send()
         elif action == 'transport-accept':
@@ -375,9 +385,10 @@ class FileTransferPlugin(BasePlugin):
                     'creator': file_info.get('content_creator', 'initiator'),
                     'name': file_info.get('content_name', 'file')
                 })
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
-                    'sid': new_ibb_sid, 'block-size': '4096'
-                })
+                ibb_attrs = {'sid': new_ibb_sid, 'block-size': '4096'}
+                if sid in self.bot.pending_files and self.bot.pending_files[sid].get('ibb_stanzas'):
+                    ibb_attrs['stanzas'] = self.bot.pending_files[sid]['ibb_stanzas']
+                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', ibb_attrs)
                 reply.append(res_j); reply.send()
 
             if not file_info.get('ibb_allowed'):
