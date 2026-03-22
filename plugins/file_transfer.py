@@ -5,6 +5,7 @@ import hashlib
 import asyncio
 import logging
 import aiohttp
+import base64  # ДОБАВЛЕНО ДЛЯ РАСПАКОВКИ IBB MESSAGE
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
 from utils import get_dir_size, safe_quote, get_unique_path
@@ -63,11 +64,31 @@ class FileTransferPlugin(BasePlugin):
         self.bot.register_handler(
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
-        # Slixmpp's xep_0047 handles <message/> IBB stanzas automatically if registered.
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        
+        # ДОБАВЛЕНО: Регистрируем перехватчик входящего XML для IBB <message>
+        self.bot.add_filter('in', self._intercept_ibb_messages)
+
+    # ДОБАВЛЕНО: Сам метод перехвата, убивающий проблему <not-acceptable>
+    def _intercept_ibb_messages(self, stanza):
+        try:
+            if hasattr(stanza, 'xml') and stanza.xml.tag.endswith('message'):
+                data_el = stanza.xml.find('{http://jabber.org/protocol/ibb}data')
+                if data_el is not None:
+                    sid = data_el.get('sid')
+                    file_info = self.bot.pending_files.get(sid)
+                    # Если есть стрим, кидаем данные напрямую в него
+                    if file_info and 'stream' in file_info:
+                        if data_el.text:
+                            chunk = base64.b64decode(data_el.text)
+                            file_info['stream'].recv_queue.put_nowait(chunk)
+                        # Возвращаем None! Это удаляет станзу, Slixmpp не отправит ошибку
+                        return None 
+        except Exception as e:
+            logging.error(f"IBB filter error: {e}")
+        return stanza
 
     def _should_log_xml(self, xml):
-        # Check root tag and children for FT namespaces
         has_ft_ns = False
         for prefix in self._ft_ns_prefixes:
             if prefix in xml.tag:
@@ -82,7 +103,6 @@ class FileTransferPlugin(BasePlugin):
                 if has_ft_ns:
                     break
 
-        # Check by ID for result/error responses
         stanza_id = xml.get('id')
         if stanza_id in self._tracked_ft_ids:
             if xml.get('type') in ('result', 'error'):
@@ -438,13 +458,18 @@ class FileTransferPlugin(BasePlugin):
             if file_info['peer_jid'].bare != stream.peer_jid.bare:
                 stream.close(); return
             logging.info(f"IBB stream started for sid={sid}")
+            
+            # ДОБАВЛЕНО: Сохраняем объект потока, чтобы фильтр перехвата мог положить в него данные!
+            self.bot.pending_files[sid]['stream'] = stream
+            
             self.bot.pending_files[f"task_{sid}"] = asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
         else: stream.close()
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = get_unique_path(os.path.join(user_dir, os.path.basename(file_info['name'])))
-        received, loop = 0, asyncio.get_event_loop()
+        received, loop = asyncio.get_event_loop().time() * 0, asyncio.get_event_loop() # quick hack to avoid unbound 'received'
+        received = 0
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
