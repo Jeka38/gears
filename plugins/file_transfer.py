@@ -126,7 +126,7 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_xml_in(self, xml):
         if self._should_log_xml(xml):
-            logging.info(f"RECV FT XML:\n{self._to_log_str(xml)}")
+            logging.info(f"RECV FT XML from {xml.get('from', 'unknown')}:\n{self._to_log_str(xml)}")
             if xml.tag.endswith('}iq'):
                 stanza_id = xml.get('id')
                 if stanza_id:
@@ -140,7 +140,7 @@ class FileTransferPlugin(BasePlugin):
 
     def handle_xml_out(self, xml):
         if self._should_log_xml(xml):
-            logging.info(f"SENT FT XML:\n{self._to_log_str(xml)}")
+            logging.info(f"SENT FT XML to {xml.get('to', 'unknown')}:\n{self._to_log_str(xml)}")
             if xml.tag.endswith('}iq'):
                 stanza_id = xml.get('id')
                 if stanza_id:
@@ -191,6 +191,7 @@ class FileTransferPlugin(BasePlugin):
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
+        logging.info(f"JINGLE EVENT: action={action}, sid={sid}, from={iq['from']}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
                 reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
@@ -317,6 +318,7 @@ class FileTransferPlugin(BasePlugin):
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
             sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+            logging.info(f"SI REQUEST: sid={sid}, from={iq['from']}, file={tag.get('name')}, size={tag.get('size')}")
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
@@ -395,6 +397,7 @@ class FileTransferPlugin(BasePlugin):
 
             for host in hosts:
                 try:
+                    logging.info(f"S5B: Connecting to {host.get('host')}:{host.get('port', 1080)} for sid={sid}")
                     reader, writer = await asyncio.wait_for(asyncio.open_connection(host.get('host'), int(host.get('port', 1080))), 5)
                     writer.write(b"\x05\x01\x00"); await writer.drain()
                     if await reader.read(2) != b"\x05\x00": writer.close(); continue
@@ -419,8 +422,11 @@ class FileTransferPlugin(BasePlugin):
                             ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
                             reply.append(res_q)
                         reply.send()
+                    logging.info(f"S5B: SUCCESS connect to {host.get('host')}:{host.get('port')} for sid={sid}")
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
-                except Exception: continue
+                except Exception as e:
+                    logging.info(f"S5B: Failed connect to {host.get('host')} for sid={sid}: {e}")
+                    continue
             if not jingle_sid:
                 reply = iq.reply(); reply['type'] = 'error'; reply.send()
             elif file_info.get('ibb_allowed'):
@@ -457,19 +463,16 @@ class FileTransferPlugin(BasePlugin):
         if file_info:
             if file_info['peer_jid'].bare != stream.peer_jid.bare:
                 stream.close(); return
-            logging.info(f"IBB stream started for sid={sid}")
-            
-            # ДОБАВЛЕНО: Сохраняем объект потока, чтобы фильтр перехвата мог положить в него данные!
+            logging.info(f"IBB stream started for sid={sid}, peer={stream.peer_jid}")
             self.bot.pending_files[sid]['stream'] = stream
-            
             self.bot.pending_files[f"task_{sid}"] = asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
         else: stream.close()
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
+        logging.info(f"DOWNLOAD START: sid={sid}, peer={peer_jid}, file={file_info['name']}, size={file_info['size']}")
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = get_unique_path(os.path.join(user_dir, os.path.basename(file_info['name'])))
-        received, loop = asyncio.get_event_loop().time() * 0, asyncio.get_event_loop() # quick hack to avoid unbound 'received'
-        received = 0
+        received, loop = 0, asyncio.get_event_loop()
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
@@ -479,11 +482,13 @@ class FileTransferPlugin(BasePlugin):
                     await loop.run_in_executor(None, f.write, chunk); received += len(chunk)
                 await loop.run_in_executor(None, f.flush); await loop.run_in_executor(None, os.fsync, f.fileno())
             if received == file_info['size']:
+                logging.info(f"DOWNLOAD COMPLETE: sid={sid}, path={path}")
                 self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(os.path.basename(path))}", mtype='chat')
             else:
+                logging.error(f"DOWNLOAD INCOMPLETE: sid={sid}, received {received}/{file_info['size']}")
                 if os.path.exists(path): os.remove(path)
         except Exception as e:
-            logging.error(f"DOWNLOAD ERROR: {e}")
+            logging.error(f"DOWNLOAD ERROR: sid={sid}, error={e}")
             if os.path.exists(path): os.remove(path)
         finally:
             info = self.bot.pending_files.get(sid)
