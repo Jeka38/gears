@@ -316,7 +316,7 @@ class FileTransferPlugin(BasePlugin):
 
             await offer_iq.send()
         except Exception as e:
-            logging.error(f"Error offering proxies to SI initiator: {e}", exc_info=True)
+            logging.info(f"SI proxy offer negotiation result for {peer_jid}: {e}")
 
     def handle_raw_s5b(self, iq):
         if iq['type'] in ('error', 'result'): return
@@ -373,7 +373,8 @@ class FileTransferPlugin(BasePlugin):
                 if not hosts and used is None:
                     # SI protocol: empty S5B request -> reply result -> then bot sends its candidates
                     iq.reply().send()
-                    asyncio.create_task(self._offer_proxies_to_initiator(iq['from'], sid))
+                    if sid in self.bot.pending_files and not self.bot.pending_files[sid].get('provided_proxies'):
+                        asyncio.create_task(self._offer_proxies_to_initiator(iq['from'], sid))
                     return
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
