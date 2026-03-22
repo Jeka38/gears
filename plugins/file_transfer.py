@@ -41,8 +41,40 @@ class FileTransferPlugin(BasePlugin):
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        self.bot.add_event_handler("ibb_stream_request", self.handle_ibb_stream_request)
+
+    def handle_ibb_stream_request(self, iq):
+        if iq['type'] in ('error', 'result'): return
+        sid = iq.xml.find('{http://jabber.org/protocol/ibb}open').get('sid')
+        peer_jid = iq['from']
+
+        # Exact match
+        if sid in self.bot.pending_files:
+            logging.info(f"IBB exact match found for sid={sid}")
+            self.bot['xep_0047'].accept_stream(iq)
+            return
+
+        # Lenient match by peer JID
+        found_sid = None
+        newest_time = 0
+        for s, info in self.bot.pending_files.items():
+            if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_jid.bare:
+                if info.get('timestamp', 0) > newest_time:
+                    newest_time = info['timestamp']
+                    found_sid = s
+
+        if found_sid:
+            logging.info(f"IBB lenient match found for peer={peer_jid.bare}, mapping {sid} to {found_sid}")
+            self.bot.pending_files[sid] = self.bot.pending_files[found_sid]
+            self.bot['xep_0047'].accept_stream(iq)
+        else:
+            logging.warning(f"IBB request REJECTED: no pending session for {peer_jid.bare} (sid={sid})")
+            reply = iq.error()
+            reply['error']['condition'] = 'item-not-found'
+            reply.send()
 
     def handle_iq_oob(self, iq):
+        if iq['type'] in ('error', 'result'): return
         logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{jabber:iq:oob}query')
         if query is None: return
@@ -79,6 +111,7 @@ class FileTransferPlugin(BasePlugin):
             if os.path.exists(path): os.remove(path)
 
     def handle_jingle(self, iq):
+        if iq['type'] in ('error', 'result'): return
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
@@ -111,7 +144,7 @@ class FileTransferPlugin(BasePlugin):
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
                 'peer_jid': iq['from'], 'ibb_allowed': True,
                 'content_name': content.get('name'), 'content_creator': content.get('creator'),
-                'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
+                'ft_ns': ft_ns, 'session_sid': sid, 'transport_sid': transport_sid, 's5b_connecting': False
             }
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
             iq.reply().send()
@@ -177,12 +210,16 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
     def handle_raw_si(self, iq):
+        if iq['type'] in ('error', 'result'): return
         logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
             reply = iq.reply(); reply['type'] = 'error'; return reply.send()
         try:
             si = iq.xml.find('{http://jabber.org/protocol/si}si')
-            sid, tag = si.get('id'), si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+            if si is None: return
+            tag = si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+            if tag is None: return
+            sid = si.get('id')
             fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
             user_dir, _ = self.bot.get_user_info(iq['from'])
             if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
@@ -214,9 +251,16 @@ class FileTransferPlugin(BasePlugin):
         except Exception as e: logging.error(f"SI ERROR: {e}")
 
     def handle_raw_s5b(self, iq):
+        if iq['type'] in ('error', 'result'): return
         logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
-        if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
+        if query is None:
+            reply = iq.error()
+            reply['error']['condition'] = 'bad-request'
+            reply.send()
+            return
+
+        if query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
              asyncio.create_task(self._socks5_connect_and_save(iq))
         else:
              self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq))
@@ -289,7 +333,9 @@ class FileTransferPlugin(BasePlugin):
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if not jingle_sid:
-                reply = iq.reply(); reply['type'] = 'error'; reply.send()
+                reply = iq.error()
+                reply['error']['condition'] = 'item-not-found'
+                reply.send()
             elif file_info.get('ibb_allowed'):
                 logging.info(f"SOCKS5 failed for Jingle sid={sid}, falling back to IBB")
                 new_ibb_sid = f"fallback_{sid}"
@@ -335,6 +381,22 @@ class FileTransferPlugin(BasePlugin):
                 await loop.run_in_executor(None, f.flush); await loop.run_in_executor(None, os.fsync, f.fileno())
             if received == file_info['size']:
                 self.bot.send_message(mto=peer_jid, mbody=f"✅ Готово!\n{self.bot.base_url}/{user_hash}/{safe_quote(os.path.basename(path))}", mtype='chat')
+                if 'session_sid' in file_info:
+                    # Jingle success signaling
+                    s_sid, ft_ns = file_info['session_sid'], file_info.get('ft_ns', 'urn:xmpp:jingle:apps:file-transfer:5')
+
+                    # session-info (received)
+                    info_iq = self.bot.make_iq_set(ito=peer_jid)
+                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-info', 'sid': s_sid})
+                    ET.SubElement(res_j, f'{{{ft_ns}}}received', {'xmlns': ft_ns})
+                    info_iq.append(res_j); info_iq.send()
+
+                    # session-terminate (success)
+                    term_iq = self.bot.make_iq_set(ito=peer_jid)
+                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-terminate', 'sid': s_sid})
+                    reason = ET.SubElement(res_j, '{urn:xmpp:jingle:1}reason')
+                    ET.SubElement(reason, '{urn:xmpp:jingle:1}success')
+                    term_iq.append(res_j); term_iq.send()
             else:
                 if os.path.exists(path): os.remove(path)
         except Exception as e:

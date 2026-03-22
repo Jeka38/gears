@@ -29,7 +29,7 @@ class OBBFastBot(ClientXMPP):
         # Initialize core features via plugins
         self.register_plugin('xep_0030')
         self.register_plugin('xep_0047')
-        self['xep_0047'].auto_accept = True
+        self['xep_0047'].auto_accept = False
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
@@ -51,8 +51,11 @@ class OBBFastBot(ClientXMPP):
         self.file_transfer = FileTransferPlugin(self)
         self.commands = CommandsPlugin(self)
 
+    def make_iq_set(self, ito=None, ifrom=None):
+        return self.make_iq(itype='set', ito=ito, ifrom=ifrom)
 
     def handle_ping(self, iq):
+        if iq['type'] in ('error', 'result'): return
         logging.info(f"PING RECV from {iq['from']}")
         reply = iq.reply(); reply.append(ET.Element('{urn:xmpp:ping}ping')); reply.send()
         logging.info(f"PONG SENT to {iq['from']}")
