@@ -310,9 +310,13 @@ class FileTransferPlugin(BasePlugin):
             query = ET.SubElement(offer_iq.xml, '{http://jabber.org/protocol/bytestreams}query', {'sid': sid, 'mode': 'tcp'})
             for p_jid, p_info in self.proxies.items():
                 ET.SubElement(query, 'streamhost', host=p_info['host'], port=str(p_info.get('port', 1080)), jid=p_jid)
+
+            if sid in self.bot.pending_files:
+                self.bot.pending_files[sid]['provided_proxies'] = True
+
             await offer_iq.send()
         except Exception as e:
-            logging.error(f"Error offering proxies to SI initiator: {e}")
+            logging.error(f"Error offering proxies to SI initiator: {e}", exc_info=True)
 
     def handle_raw_s5b(self, iq):
         if iq['type'] in ('error', 'result'): return
@@ -367,10 +371,10 @@ class FileTransferPlugin(BasePlugin):
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
                 if not hosts and used is None:
-                    reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                    for p_jid, p_info in self.proxies.items():
-                        ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info.get('port', 1080)), jid=p_jid)
-                    reply.append(res_q); reply.send(); return
+                    # SI protocol: empty S5B request -> reply result -> then bot sends its candidates
+                    iq.reply().send()
+                    asyncio.create_task(self._offer_proxies_to_initiator(iq['from'], sid))
+                    return
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
             t_sid = file_info.get('transport_sid', sid)
@@ -407,7 +411,12 @@ class FileTransferPlugin(BasePlugin):
                     elif atyp == 0x04: await reader.read(18)
 
                     # Proxy Activation (XEP-0065)
-                    if h_jid in self.proxies:
+                    # Use bare JID for matching discovered proxies or check Jingle my_candidates
+                    is_my_proxy = h_jid and (h_jid.bare in self.proxies or h_jid.full in self.proxies)
+                    if not is_my_proxy and jingle_sid:
+                        is_my_proxy = any(c.get('jid') == h_jid for c in file_info.get('my_candidates', []))
+
+                    if is_my_proxy or file_info.get('provided_proxies'):
                         logging.info(f"Activating SOCKS5 proxy: {h_jid}")
                         act_iq = self.bot.make_iq_set(ito=h_jid)
                         query_act = ET.SubElement(act_iq.xml, '{http://jabber.org/protocol/bytestreams}query', {'sid': t_sid})
