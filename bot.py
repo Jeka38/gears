@@ -30,6 +30,8 @@ class OBBFastBot(ClientXMPP):
         self.register_plugin('xep_0030')
         self.register_plugin('xep_0047')
         self['xep_0047'].auto_accept = True
+        self['xep_0047'].block_size = 8192
+        self['xep_0047'].max_block_size = 65536
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
