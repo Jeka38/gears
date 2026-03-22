@@ -27,6 +27,7 @@ class PresencePlugin(BasePlugin):
         self.bot['xep_0030'].add_feature('jabber:x:oob')
         self.bot.send_presence(pstatus=STATUS_MESSAGE)
         await self.bot.get_roster()
+        asyncio.create_task(self.bot.file_transfer.discover_proxies())
         logging.info(f"✅ БОТ ЗАПУЩЕН: {self.bot.boundjid}")
 
     def handle_presence_subscribe(self, presence):

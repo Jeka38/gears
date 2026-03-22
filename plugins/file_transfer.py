@@ -19,15 +19,45 @@ class FileTransferPlugin(BasePlugin):
             return ip
         except: return '127.0.0.1'
 
-    KNOWN_PROXIES = {
-        'proxy.eu.jabber.network': {'host': 'proxy.eu.jabber.network', 'port': 1080},
-        'proxy.jabber.ru': {'host': 'proxy.jabber.ru', 'port': 1080},
-        'proxy.jabbim.cz': {'host': 'proxy.jabbim.cz', 'port': 1080},
-        'proxy.yax.im': {'host': 'proxy.yax.im', 'port': 1080},
-    }
+    async def discover_proxies(self):
+        logging.info("SOCKS5 Proxy Discovery started")
+        try:
+            # Step 1: Discover items on our server
+            items = await self.bot['xep_0030'].get_items(jid=self.bot.boundjid.domain)
+            for item in items['disco_items']:
+                target_jid = item['jid']
+                try:
+                    # Step 2: Query info for each item
+                    info = await self.bot['xep_0030'].get_info(jid=target_jid)
+                    # Step 3: Check for SOCKS5 bytestreams feature
+                    if 'http://jabber.org/protocol/bytestreams' in info['features']:
+                        # Step 4: Query the proxy for its host/port
+                        iq = self.bot.make_iq_get(ito=target_jid)
+                        iq.append(ET.Element('{http://jabber.org/protocol/bytestreams}query'))
+                        res = await iq.send()
+                        query = res.xml.find('{http://jabber.org/protocol/bytestreams}query')
+                        if query is not None:
+                            streamhost = query.find('{http://jabber.org/protocol/bytestreams}streamhost')
+                            if streamhost is not None:
+                                host, port = streamhost.get('host'), streamhost.get('port', '1080')
+                                self.proxies[target_jid] = {'host': host, 'port': port}
+                                logging.info(f"DISCOVERED PROXY: {target_jid} -> {host}:{port}")
+                except Exception as e:
+                    logging.debug(f"Disco info failed for {target_jid}: {e}")
+
+            # Add fallback known proxies if none discovered
+            if not self.proxies:
+                 self.proxies = {
+                    'proxy.eu.jabber.network': {'host': 'proxy.eu.jabber.network', 'port': '1080'},
+                    'proxy.jabber.ru': {'host': 'proxy.jabber.ru', 'port': '1080'},
+                 }
+                 logging.info("No proxies discovered, using fallbacks")
+        except Exception as e:
+            logging.error(f"Proxy discovery error: {e}")
 
     def __init__(self, bot):
         super().__init__(bot)
+        self.proxies = {}
         self.bot.register_handler(
             handler.Callback('SI', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'), self.handle_raw_si)
         )
@@ -166,8 +196,11 @@ class FileTransferPlugin(BasePlugin):
                                   cid='direct-host', priority='8253074', type='host')
 
                     # Proxy candidates
-                    for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
-                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
+                    for p_jid, p_info in self.proxies.items():
+                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate',
+                                      host=p_info['host'], port=str(p_info.get('port', 1080)),
+                                      jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(),
+                                      priority='65536', type='proxy')
                 elif ibb_t is not None:
                     ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
                 else:
@@ -283,15 +316,15 @@ class FileTransferPlugin(BasePlugin):
                 sid, peer_full = query.get('sid'), iq['from'].full
                 used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
                 if used is not None:
-                    jid = used.get('jid'); proxy = self.KNOWN_PROXIES.get(jid)
-                    if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy['port']), jid=jid)]
+                    jid = used.get('jid'); proxy = self.proxies.get(jid)
+                    if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy.get('port', 1080)), jid=jid)]
                     else: reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
                 else:
                     hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
                 if not hosts and used is None:
                     reply = iq.reply(); res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
-                    for p_jid, p_info in self.KNOWN_PROXIES.items():
-                        ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info['port']), jid=p_jid)
+                    for p_jid, p_info in self.proxies.items():
+                        ET.SubElement(res_q, 'streamhost', host=p_info['host'], port=str(p_info.get('port', 1080)), jid=p_jid)
                     reply.append(res_q); reply.send(); return
             file_info = self.bot.pending_files.get(sid)
             if not file_info: return
