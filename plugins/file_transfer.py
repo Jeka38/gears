@@ -262,6 +262,7 @@ class FileTransferPlugin(BasePlugin):
             if not file_info: return
             t_sid = file_info.get('transport_sid', sid)
             dst_addr = hashlib.sha1(f"{t_sid}{peer_full}{self.bot.boundjid.full}".encode()).hexdigest()
+            logging.info(f"S5B Negotiation:\n  SID: {t_sid}\n  Initiator: {peer_full}\n  Target: {self.bot.boundjid.full}\n  dst_addr: {dst_addr}")
 
             if jingle_sid and not hosts:
                 jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
