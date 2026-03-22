@@ -1,9 +1,11 @@
 import os
+import copy
 import socket
 import hashlib
 import asyncio
 import logging
 import aiohttp
+import base64  # ДОБАВЛЕНО ДЛЯ РАСПАКОВКИ IBB MESSAGE
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
 from utils import get_dir_size, safe_quote, get_unique_path
@@ -26,8 +28,30 @@ class FileTransferPlugin(BasePlugin):
         'proxy.yax.im': {'host': 'proxy.yax.im', 'port': 1080},
     }
 
+    FT_NAMESPACES = {
+        'urn:xmpp:jingle:1',
+        'urn:xmpp:jingle:apps:file-transfer:1',
+        'urn:xmpp:jingle:apps:file-transfer:2',
+        'urn:xmpp:jingle:apps:file-transfer:3',
+        'urn:xmpp:jingle:apps:file-transfer:4',
+        'urn:xmpp:jingle:apps:file-transfer:5',
+        'urn:xmpp:jingle:transports:s5b:1',
+        'urn:xmpp:jingle:transports:ibb:1',
+        'http://jabber.org/protocol/si',
+        'http://jabber.org/protocol/si/profile/file-transfer',
+        'http://jabber.org/protocol/bytestreams',
+        'http://jabber.org/protocol/ibb',
+        'jabber:iq:oob',
+        'jabber:x:oob',
+        'urn:xmpp:bob'
+    }
+
     def __init__(self, bot):
         super().__init__(bot)
+        self._tracked_ft_ids = set()
+        self._ft_ns_prefixes = [f'{{{ns}}}' for ns in self.FT_NAMESPACES]
+        self.bot.add_event_handler("xml_in", self.handle_xml_in)
+        self.bot.add_event_handler("xml_out", self.handle_xml_out)
         self.bot.register_handler(
             handler.Callback('SI', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'), self.handle_raw_si)
         )
@@ -41,9 +65,94 @@ class FileTransferPlugin(BasePlugin):
             handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
+        
+        # ДОБАВЛЕНО: Регистрируем перехватчик входящего XML для IBB <message>
+        self.bot.add_filter('in', self._intercept_ibb_messages)
+
+    # ДОБАВЛЕНО: Сам метод перехвата, убивающий проблему <not-acceptable>
+    def _intercept_ibb_messages(self, stanza):
+        try:
+            if hasattr(stanza, 'xml') and stanza.xml.tag.endswith('message'):
+                data_el = stanza.xml.find('{http://jabber.org/protocol/ibb}data')
+                if data_el is not None:
+                    sid = data_el.get('sid')
+                    file_info = self.bot.pending_files.get(sid)
+                    # Если есть стрим, кидаем данные напрямую в него
+                    if file_info and 'stream' in file_info:
+                        if data_el.text:
+                            chunk = base64.b64decode(data_el.text)
+                            file_info['stream'].recv_queue.put_nowait(chunk)
+                        # Возвращаем None! Это удаляет станзу, Slixmpp не отправит ошибку
+                        return None 
+        except Exception as e:
+            logging.error(f"IBB filter error: {e}")
+        return stanza
+
+    def _should_log_xml(self, xml):
+        has_ft_ns = False
+        for prefix in self._ft_ns_prefixes:
+            if prefix in xml.tag:
+                has_ft_ns = True
+                break
+        if not has_ft_ns:
+            for child in xml:
+                for prefix in self._ft_ns_prefixes:
+                    if prefix in child.tag:
+                        has_ft_ns = True
+                        break
+                if has_ft_ns:
+                    break
+
+        stanza_id = xml.get('id')
+        if stanza_id in self._tracked_ft_ids:
+            if xml.get('type') in ('result', 'error'):
+                pass
+            return True
+
+        return has_ft_ns
+
+    def _to_log_str(self, xml):
+        xml_copy = copy.deepcopy(xml)
+        for data in xml_copy.findall('.//{http://jabber.org/protocol/ibb}data'):
+            if data.text and len(data.text) > 100:
+                data.text = data.text[:50] + f"...[TRUNCATED {len(data.text)} bytes]..." + data.text[-10:]
+        for data in xml_copy.findall('.//{urn:xmpp:bob}data'):
+            if data.text and len(data.text) > 100:
+                data.text = data.text[:50] + f"...[TRUNCATED {len(data.text)} bytes]..." + data.text[-10:]
+        if xml_copy.tag.endswith('}data') and ('http://jabber.org/protocol/ibb' in xml_copy.tag or 'urn:xmpp:bob' in xml_copy.tag):
+            if xml_copy.text and len(xml_copy.text) > 100:
+                xml_copy.text = xml_copy.text[:50] + f"...[TRUNCATED {len(xml_copy.text)} bytes]..." + xml_copy.text[-10:]
+        return ET.tostring(xml_copy, encoding='unicode')
+
+    def handle_xml_in(self, xml):
+        if self._should_log_xml(xml):
+            logging.info(f"RECV FT XML:\n{self._to_log_str(xml)}")
+            if xml.tag.endswith('}iq'):
+                stanza_id = xml.get('id')
+                if stanza_id:
+                    if xml.get('type') in ('get', 'set'):
+                        self._tracked_ft_ids.add(stanza_id)
+                    else:
+                        self._tracked_ft_ids.discard(stanza_id)
+            elif xml.tag.endswith('}message') and xml.get('type') == 'error':
+                stanza_id = xml.get('id')
+                if stanza_id: self._tracked_ft_ids.discard(stanza_id)
+
+    def handle_xml_out(self, xml):
+        if self._should_log_xml(xml):
+            logging.info(f"SENT FT XML:\n{self._to_log_str(xml)}")
+            if xml.tag.endswith('}iq'):
+                stanza_id = xml.get('id')
+                if stanza_id:
+                    if xml.get('type') in ('get', 'set'):
+                        self._tracked_ft_ids.add(stanza_id)
+                    else:
+                        self._tracked_ft_ids.discard(stanza_id)
+            elif xml.tag.endswith('}message') and xml.get('type') == 'error':
+                stanza_id = xml.get('id')
+                if stanza_id: self._tracked_ft_ids.discard(stanza_id)
 
     def handle_iq_oob(self, iq):
-        logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{jabber:iq:oob}query')
         if query is None: return
         url_tag = query.find('{jabber:iq:oob}url')
@@ -82,7 +191,6 @@ class FileTransferPlugin(BasePlugin):
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
-        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
                 reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
@@ -111,7 +219,8 @@ class FileTransferPlugin(BasePlugin):
                 'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
                 'peer_jid': iq['from'], 'ibb_allowed': True,
                 'content_name': content.get('name'), 'content_creator': content.get('creator'),
-                'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False
+                'ft_ns': ft_ns, 'transport_sid': transport_sid, 's5b_connecting': False,
+                'ibb_stanzas': ibb_t.get('stanzas') if ibb_t is not None else None
             }
             if transport_sid != sid: self.bot.pending_files[transport_sid] = self.bot.pending_files[sid]
             iq.reply().send()
@@ -136,9 +245,24 @@ class FileTransferPlugin(BasePlugin):
                     for p_host, p_jid in [('proxy.eu.jabber.network', 'proxy.eu.jabber.network'), ('proxy.jabber.ru', 'proxy.jabber.ru')]:
                         ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate', host=p_host, port='1080', jid=p_jid, cid=hashlib.md5(p_jid.encode()).hexdigest(), priority='65536', type='proxy')
                 elif ibb_t is not None:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': transport_sid})
+                    b_size = int(ibb_t.get('block-size', '8192'))
+                    use_msg = ibb_t.get('stanzas') == 'message'
+                    ibb_attrs = {'block-size': str(b_size), 'sid': transport_sid}
+                    if use_msg: ibb_attrs['stanzas'] = 'message'
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', ibb_attrs)
+
+                    # Pre-initialize IBB stream for Slixmpp
+                    from slixmpp.plugins.xep_0047 import IBBytestream
+                    stream = IBBytestream(self.bot, transport_sid, b_size, self.bot.boundjid, iq['from'], use_msg)
+                    asyncio.create_task(self.bot['xep_0047'].api['set_stream'](self.bot.boundjid, transport_sid, iq['from'], stream))
+                    self.bot.event('ibb_stream_start', stream)
                 else:
-                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '4096', 'sid': sid})
+                    ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'block-size': '8192', 'sid': sid})
+                    # Also pre-initialize for default IBB fallback
+                    from slixmpp.plugins.xep_0047 import IBBytestream
+                    stream = IBBytestream(self.bot, sid, 8192, self.bot.boundjid, iq['from'], False)
+                    asyncio.create_task(self.bot['xep_0047'].api['set_stream'](self.bot.boundjid, sid, iq['from'], stream))
+                    self.bot.event('ibb_stream_start', stream)
 
                 accept_iq.append(res_j); accept_iq.send()
                 if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
@@ -161,13 +285,24 @@ class FileTransferPlugin(BasePlugin):
                     if sid in self.bot.pending_files:
                         ibb_sid = ibb_t.get('sid')
                         self.bot.pending_files[sid]['transport_sid'] = ibb_sid
+                        self.bot.pending_files[sid]['ibb_stanzas'] = ibb_t.get('stanzas')
                         self.bot.pending_files[ibb_sid] = self.bot.pending_files[sid]
                         reply = self.bot.make_iq_set(ito=iq['from'])
                         res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-accept', 'sid': sid})
                         res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                             'creator': content.get('creator'), 'name': content.get('name')
                         })
-                        ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {'sid': ibb_t.get('sid')})
+                        use_msg = ibb_t.get('stanzas') == 'message'
+                        ibb_attrs = {'sid': ibb_sid}
+                        if use_msg: ibb_attrs['stanzas'] = 'message'
+                        ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', ibb_attrs)
+
+                        # Pre-initialize IBB stream for Slixmpp
+                        from slixmpp.plugins.xep_0047 import IBBytestream
+                        stream = IBBytestream(self.bot, ibb_sid, 8192, self.bot.boundjid, iq['from'], use_msg)
+                        asyncio.create_task(self.bot['xep_0047'].api['set_stream'](self.bot.boundjid, ibb_sid, iq['from'], stream))
+                        self.bot.event('ibb_stream_start', stream)
+
                         reply.append(res_j); reply.send()
             iq.reply().send()
         elif action == 'transport-accept':
@@ -177,7 +312,6 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
     def handle_raw_si(self, iq):
-        logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
             reply = iq.reply(); reply['type'] = 'error'; return reply.send()
         try:
@@ -214,7 +348,6 @@ class FileTransferPlugin(BasePlugin):
         except Exception as e: logging.error(f"SI ERROR: {e}")
 
     def handle_raw_s5b(self, iq):
-        logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
         if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
              asyncio.create_task(self._socks5_connect_and_save(iq))
@@ -302,9 +435,16 @@ class FileTransferPlugin(BasePlugin):
                     'creator': file_info.get('content_creator', 'initiator'),
                     'name': file_info.get('content_name', 'file')
                 })
-                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', {
-                    'sid': new_ibb_sid, 'block-size': '4096'
-                })
+                use_msg = self.bot.pending_files.get(sid, {}).get('ibb_stanzas') == 'message'
+                ibb_attrs = {'sid': new_ibb_sid, 'block-size': '8192'}
+                if use_msg: ibb_attrs['stanzas'] = 'message'
+                ET.SubElement(res_c, '{urn:xmpp:jingle:transports:ibb:1}transport', ibb_attrs)
+
+                # Pre-initialize IBB stream for Slixmpp
+                from slixmpp.plugins.xep_0047 import IBBytestream
+                stream = IBBytestream(self.bot, new_ibb_sid, 8192, self.bot.boundjid, iq['from'], use_msg)
+                asyncio.create_task(self.bot['xep_0047'].api['set_stream'](self.bot.boundjid, new_ibb_sid, iq['from'], stream))
+                self.bot.event('ibb_stream_start', stream)
                 reply.append(res_j); reply.send()
 
             if not file_info.get('ibb_allowed'):
@@ -318,13 +458,18 @@ class FileTransferPlugin(BasePlugin):
             if file_info['peer_jid'].bare != stream.peer_jid.bare:
                 stream.close(); return
             logging.info(f"IBB stream started for sid={sid}")
+            
+            # ДОБАВЛЕНО: Сохраняем объект потока, чтобы фильтр перехвата мог положить в него данные!
+            self.bot.pending_files[sid]['stream'] = stream
+            
             self.bot.pending_files[f"task_{sid}"] = asyncio.create_task(self.download_file_task(stream, file_info, stream.peer_jid, sid))
         else: stream.close()
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = get_unique_path(os.path.join(user_dir, os.path.basename(file_info['name'])))
-        received, loop = 0, asyncio.get_event_loop()
+        received, loop = asyncio.get_event_loop().time() * 0, asyncio.get_event_loop() # quick hack to avoid unbound 'received'
+        received = 0
         try:
             with open(path, 'wb') as f:
                 while received < file_info['size']:
