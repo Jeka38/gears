@@ -94,13 +94,10 @@ class FileTransferPlugin(BasePlugin):
                 if has_ft_ns:
                     break
 
-        # Check by IQ ID for result/error responses
-        iq_id = xml.get('id')
-        if iq_id in self._tracked_ft_ids:
+        # Check by ID for result/error responses
+        stanza_id = xml.get('id')
+        if stanza_id in self._tracked_ft_ids:
             if xml.get('type') in ('result', 'error'):
-                # We can remove the ID after seeing the response to prevent set growth
-                # (Assuming one response per request)
-                # But wait, multiple responses are rare for IQs.
                 pass
             return True
 
@@ -123,25 +120,30 @@ class FileTransferPlugin(BasePlugin):
     def handle_xml_in(self, xml):
         if self._should_log_xml(xml):
             logging.info(f"RECV FT XML:\n{self._to_log_str(xml)}")
-            if xml.tag.endswith('}iq'):
+            if xml.tag.endswith('}iq') or xml.tag.endswith('}message'):
+                stanza_id = xml.get('id')
+                if stanza_id:
+                    if xml.get('type') in ('get', 'set', 'chat', 'normal'):
+                        self._tracked_ft_ids.add(stanza_id)
+                    elif xml.get('type') == 'error':
+                        self._tracked_ft_ids.discard(stanza_id)
+            if xml.tag.endswith('}iq') and xml.get('type') == 'result':
                 iq_id = xml.get('id')
-                if iq_id:
-                    if xml.get('type') in ('get', 'set'):
-                        self._tracked_ft_ids.add(iq_id)
-                    elif xml.get('type') in ('result', 'error'):
-                        self._tracked_ft_ids.discard(iq_id)
+                if iq_id: self._tracked_ft_ids.discard(iq_id)
 
     def handle_xml_out(self, xml):
         if self._should_log_xml(xml):
             logging.info(f"SENT FT XML:\n{self._to_log_str(xml)}")
-            if xml.tag.endswith('}iq'):
+            if xml.tag.endswith('}iq') or xml.tag.endswith('}message'):
+                stanza_id = xml.get('id')
+                if stanza_id:
+                    if xml.get('type') in ('get', 'set', 'chat', 'normal'):
+                        self._tracked_ft_ids.add(stanza_id)
+                    elif xml.get('type') == 'error':
+                        self._tracked_ft_ids.discard(stanza_id)
+            if xml.tag.endswith('}iq') and xml.get('type') == 'result':
                 iq_id = xml.get('id')
-                if iq_id:
-                    if xml.get('type') in ('get', 'set'):
-                        self._tracked_ft_ids.add(iq_id)
-                    elif xml.get('type') in ('result', 'error'):
-                        # Clean up tracked ID after sending response
-                        self._tracked_ft_ids.discard(iq_id)
+                if iq_id: self._tracked_ft_ids.discard(iq_id)
 
     def handle_iq_oob(self, iq):
         query = iq.xml.find('{jabber:iq:oob}query')
