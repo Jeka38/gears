@@ -4,6 +4,7 @@ import hashlib
 import asyncio
 import logging
 import aiohttp
+from slixmpp import JID
 from slixmpp.xmlstream import ET, matcher, handler
 from config import ADMIN_JID, ADMIN_NOTIFY_LEVEL, QUOTA_LIMIT_BYTES
 from utils import get_dir_size, safe_quote, get_unique_path
@@ -70,15 +71,22 @@ class FileTransferPlugin(BasePlugin):
         super().__init__(bot)
         self.proxies = {}
         self.bot.register_handler(
-            handler.Callback('Jingle', matcher.MatchXPath('{jabber:client}iq/{urn:xmpp:jingle:1}jingle'), self.handle_jingle)
+            handler.Callback('SI', matcher.MatchXPath('iq/{http://jabber.org/protocol/si}si'), self.handle_raw_si)
         )
         self.bot.register_handler(
-            handler.Callback('OOB', matcher.MatchXPath('{jabber:client}iq/{jabber:iq:oob}query'), self.handle_iq_oob)
+            handler.Callback('S5B', matcher.MatchXPath('iq/{http://jabber.org/protocol/bytestreams}query'), self.handle_raw_s5b)
+        )
+        self.bot.register_handler(
+            handler.Callback('Jingle', matcher.MatchXPath('iq/{urn:xmpp:jingle:1}jingle'), self.handle_jingle)
+        )
+        self.bot.register_handler(
+            handler.Callback('OOB', matcher.MatchXPath('iq/{jabber:iq:oob}query'), self.handle_iq_oob)
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
         self.bot.add_event_handler("ibb_stream_request", self.handle_ibb_stream_request)
 
     def handle_ibb_stream_request(self, iq):
+        from slixmpp import JID
         if iq['type'] in ('error', 'result'): return
         sid = iq.xml.find('{http://jabber.org/protocol/ibb}open').get('sid')
         peer_jid = iq['from']
@@ -93,10 +101,12 @@ class FileTransferPlugin(BasePlugin):
         found_sid = None
         newest_time = 0
         for s, info in self.bot.pending_files.items():
-            if isinstance(info, dict) and info.get('peer_jid') and info['peer_jid'].bare == peer_jid.bare:
-                if info.get('timestamp', 0) > newest_time:
-                    newest_time = info['timestamp']
-                    found_sid = s
+            if isinstance(info, dict) and info.get('peer_jid'):
+                p_jid = info['peer_jid']
+                if (isinstance(p_jid, JID) and p_jid.bare == peer_jid.bare) or (str(p_jid).split('/')[0] == peer_jid.bare):
+                    if info.get('timestamp', 0) > newest_time:
+                        newest_time = info['timestamp']
+                        found_sid = s
 
         if found_sid:
             logging.info(f"IBB lenient match found for peer={peer_jid.bare}, mapping {sid} to {found_sid}")
@@ -145,6 +155,78 @@ class FileTransferPlugin(BasePlugin):
             logging.error(f"OOB download error: {e}")
             if os.path.exists(path): os.remove(path)
 
+
+    def handle_raw_si(self, iq):
+        if iq['type'] in ('error', 'result'): return
+        logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        if not self.bot.is_allowed(iq['from']):
+            reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+        try:
+            si = iq.xml.find('{http://jabber.org/protocol/si}si')
+            if si is None: return
+            tag = si.find('{http://jabber.org/protocol/si/profile/file-transfer}file')
+            if tag is None: return
+            sid = si.get('id')
+            fname, fsize = os.path.basename(tag.get('name')).replace(' ', '_'), int(tag.get('size', 0))
+            user_dir, _ = self.bot.get_user_info(iq['from'])
+            if get_dir_size(user_dir) + fsize > QUOTA_LIMIT_BYTES:
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+            feature_neg = si.find('{http://jabber.org/protocol/feature-neg}feature')
+            offered_methods = []
+            if feature_neg is not None:
+                x_data = feature_neg.find('{jabber:x:data}x')
+                if x_data is not None:
+                    field = next((f for f in x_data.findall('{jabber:x:data}field') if f.get('var') == 'stream-method'), None)
+                    if field is not None:
+                        offered_methods = [v.text for v in field.findall('{jabber:x:data}value')]
+                        offered_methods.extend([v.text for v in field.findall('{jabber:x:data}option/{jabber:x:data}value')])
+            chosen_method = next((m for m in ['jabber:iq:oob', 'http://jabber.org/protocol/bytestreams', 'http://jabber.org/protocol/ibb'] if m in offered_methods), None)
+            if not chosen_method:
+                reply = iq.reply(); reply['type'] = 'error'; return reply.send()
+            self.bot.pending_files[sid] = {
+                'name': fname, 'size': fsize, 'timestamp': asyncio.get_event_loop().time(),
+                'ibb_allowed': 'http://jabber.org/protocol/ibb' in offered_methods,
+                'peer_jid': iq['from'], 'transport_sid': sid
+            }
+            reply = iq.reply()
+            res_si = ET.Element('{http://jabber.org/protocol/si}si', {'id': sid})
+            feature = ET.SubElement(res_si, '{http://jabber.org/protocol/feature-neg}feature')
+            x = ET.SubElement(feature, '{jabber:x:data}x', type='submit')
+            field = ET.SubElement(x, '{jabber:x:data}field', var='stream-method')
+            ET.SubElement(field, '{jabber:x:data}value').text = chosen_method
+            reply.append(res_si); reply.send()
+        except Exception as e: logging.error(f"SI ERROR: {e}")
+
+    async def _offer_proxies_to_initiator(self, peer_jid, sid):
+        try:
+            logging.info(f"Proactively offering proxies to SI initiator {peer_jid}")
+            offer_iq = self.bot.make_iq_set(ito=peer_jid)
+            query = ET.SubElement(offer_iq.xml, '{http://jabber.org/protocol/bytestreams}query', {'sid': sid, 'mode': 'tcp'})
+            for p_jid, p_info in self.proxies.items():
+                ET.SubElement(query, 'streamhost', host=p_info['host'], port=str(p_info.get('port', 1080)), jid=p_jid)
+
+            if sid in self.bot.pending_files:
+                self.bot.pending_files[sid]['provided_proxies'] = True
+
+            await offer_iq.send()
+        except Exception as e:
+            logging.info(f"SI proxy offer negotiation result for {peer_jid}: {e}")
+
+    def handle_raw_s5b(self, iq):
+        if iq['type'] in ('error', 'result'): return
+        logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
+        query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
+        if query is None:
+            reply = iq.error()
+            reply['error']['condition'] = 'bad-request'
+            reply.send()
+            return
+
+        if query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
+             asyncio.create_task(self._socks5_connect_and_save(iq, None))
+        else:
+             self.bot.pending_files[f"s5b_{iq['id']}"] = asyncio.create_task(self._socks5_connect_and_save(iq, None))
+
     def handle_jingle(self, iq):
         if iq['type'] in ('error', 'result'): return
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
@@ -186,7 +268,10 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
             try:
                 accept_iq = self.bot.make_iq_set(ito=iq['from'])
-                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'session-accept', 'sid': sid, 'initiator': iq['from'].full})
+                res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                    'action': 'session-accept', 'sid': sid,
+                    'initiator': iq['from'].full, 'responder': self.bot.boundjid.full
+                })
                 res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {'creator': content.get('creator'), 'name': content.get('name')})
                 res_d = ET.SubElement(res_c, f'{{{ft_ns}}}description')
                 res_f = ET.SubElement(res_d, f'{{{ft_ns}}}file')
@@ -218,7 +303,7 @@ class FileTransferPlugin(BasePlugin):
                 accept_iq.append(res_j); accept_iq.send()
                 if s5b_t is not None and s5b_t.findall('{urn:xmpp:jingle:transports:s5b:1}candidate'):
                     self.bot.pending_files[sid]['s5b_connecting'] = True
-                    self.bot.pending_files[f"jingle_s5b_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+                    self.bot.pending_files[f"jingle_s5b_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, sid))
             except Exception as e: logging.error(f"JINGLE ERROR: {e}")
         elif action == 'transport-info':
             content = jingle.find('{urn:xmpp:jingle:1}content')
@@ -226,7 +311,7 @@ class FileTransferPlugin(BasePlugin):
                 transport = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
                 if transport is not None and not self.bot.pending_files.get(sid, {}).get('s5b_connecting'):
                     self.bot.pending_files[sid]['s5b_connecting'] = True
-                    self.bot.pending_files[f"jingle_s5b_info_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, jingle_sid=sid))
+                    self.bot.pending_files[f"jingle_s5b_info_{sid}"] = asyncio.create_task(self._socks5_connect_and_save(iq, sid))
             iq.reply().send()
         elif action == 'transport-replace':
             content = jingle.find('{urn:xmpp:jingle:1}content')
@@ -238,7 +323,10 @@ class FileTransferPlugin(BasePlugin):
                         self.bot.pending_files[sid]['transport_sid'] = ibb_sid
                         self.bot.pending_files[ibb_sid] = self.bot.pending_files[sid]
                         reply = self.bot.make_iq_set(ito=iq['from'])
-                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {'action': 'transport-accept', 'sid': sid})
+                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                            'action': 'transport-accept', 'sid': sid,
+                            'initiator': iq['from'].full, 'responder': self.bot.boundjid.full
+                        })
                         res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                             'creator': content.get('creator'), 'name': content.get('name')
                         })
@@ -252,34 +340,50 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
 
-    async def _socks5_connect_and_save(self, iq, sid):
+    async def _socks5_connect_and_save(self, iq, jingle_sid):
+        sid = None
         try:
-            file_info = self.bot.pending_files.get(sid)
-            if not file_info: return
-
-            jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
-            if jingle is None: return
-            content = jingle.find('{urn:xmpp:jingle:1}content')
-            if content is None: return
-            query = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
-            if query is None: return
-            peer_full = iq['from'].full
-            used = query.find('{urn:xmpp:jingle:transports:s5b:1}candidate-used')
-
-            if used is not None:
-                cid = used.get('cid')
-                candidate = next((c for c in query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate') if c.get('cid') == cid), None)
-                if candidate is None:
-                    # Check our own candidates if it's one we offered
-                    my_c = next((c for c in file_info.get('my_candidates', []) if c.get('cid') == cid), None)
-                    if my_c:
-                        candidate = ET.Element('candidate', my_c)
-
-                if candidate is not None:
-                    hosts = [candidate]
-                else: hosts = []
+            if jingle_sid:
+                sid = jingle_sid
+                file_info = self.bot.pending_files.get(sid)
+                if not file_info: return
+                jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
+                if jingle is None: return
+                content = jingle.find('{urn:xmpp:jingle:1}content')
+                if content is None: return
+                query = content.find('{urn:xmpp:jingle:transports:s5b:1}transport')
+                if query is None: return
+                peer_full = iq['from'].full
+                used = query.find('{urn:xmpp:jingle:transports:s5b:1}candidate-used')
+                if used is not None:
+                    cid = used.get('cid')
+                    candidate = next((c for c in query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate') if c.get('cid') == cid), None)
+                    if candidate is None:
+                        # Check our own candidates if it's one we offered
+                        my_c = next((c for c in file_info.get('my_candidates', []) if c.get('cid') == cid), None)
+                        if my_c:
+                            candidate = ET.Element('candidate', my_c)
+                    if candidate is not None: hosts = [candidate]
+                    else: hosts = []
+                else:
+                    hosts = query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate')
             else:
-                hosts = query.findall('{urn:xmpp:jingle:transports:s5b:1}candidate')
+                query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
+                if query is None: return
+                sid, peer_full = query.get('sid'), iq['from'].full
+                used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
+                if used is not None:
+                    jid = used.get('jid'); proxy = self.proxies.get(jid)
+                    if proxy: hosts = [ET.Element('streamhost', host=proxy['host'], port=str(proxy.get('port', 1080)), jid=jid)]
+                    else: reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
+                else:
+                    hosts = query.findall('{http://jabber.org/protocol/bytestreams}streamhost')
+                if not hosts and used is None:
+                    # SI protocol: empty S5B request -> reply result -> then bot sends its candidates
+                    iq.reply().send()
+                    if sid in self.bot.pending_files and not self.bot.pending_files[sid].get('provided_proxies'):
+                        asyncio.create_task(self._offer_proxies_to_initiator(iq['from'], sid))
+                    return
             t_sid = file_info.get('transport_sid', sid)
             dst_addr = hashlib.sha1(f"{t_sid}{peer_full}{self.bot.boundjid.full}".encode()).hexdigest()
 
@@ -317,9 +421,11 @@ class FileTransferPlugin(BasePlugin):
 
                     # Proxy Activation (XEP-0065)
                     # Use bare JID for matching discovered proxies or check Jingle my_candidates
-                    is_my_proxy = h_jid and (h_jid.bare in self.proxies or h_jid.full in self.proxies)
+                    from slixmpp import JID
+                    h_jid_obj = JID(h_jid)
+                    is_my_proxy = any(JID(p).bare == h_jid_obj.bare for p in self.proxies)
                     if not is_my_proxy:
-                        is_my_proxy = any(c.get('jid') == h_jid for c in file_info.get('my_candidates', []))
+                        is_my_proxy = any(JID(c.get('jid')).bare == h_jid_obj.bare for c in file_info.get('my_candidates', []))
 
                     if is_my_proxy:
                         logging.info(f"Activating SOCKS5 proxy: {h_jid}")
@@ -328,19 +434,28 @@ class FileTransferPlugin(BasePlugin):
                         ET.SubElement(query_act, 'activate').text = peer_full
                         await act_iq.send()
 
-                    reply = self.bot.make_iq_set(ito=iq['from'])
-                    res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
-                        'action': 'transport-info',
-                        'sid': sid,
-                        'initiator': peer_full
-                    })
-                    res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
-                        'creator': file_info.get('content_creator', 'initiator'),
-                        'name': file_info.get('content_name', 'file')
-                    })
-                    res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': t_sid})
-                    ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', cid=host.get('cid'))
-                    reply.append(res_j); reply.send()
+                    if jingle_sid:
+                        reply = self.bot.make_iq_set(ito=iq['from'])
+                        res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
+                            'action': 'transport-info',
+                            'sid': sid,
+                            'initiator': peer_full,
+                            'responder': self.bot.boundjid.full
+                        })
+                        res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
+                            'creator': file_info.get('content_creator', 'initiator'),
+                            'name': file_info.get('content_name', 'file')
+                        })
+                        res_t = ET.SubElement(res_c, '{urn:xmpp:jingle:transports:s5b:1}transport', {'sid': t_sid})
+                        ET.SubElement(res_t, '{urn:xmpp:jingle:transports:s5b:1}candidate-used', cid=host.get('cid'))
+                        reply.append(res_j); reply.send()
+                    else:
+                        reply = iq.reply()
+                        if used is None:
+                            res_q = ET.Element('{http://jabber.org/protocol/bytestreams}query', {'sid': sid})
+                            ET.SubElement(res_q, 'streamhost-used', jid=host.get('jid'))
+                            reply.append(res_q)
+                        reply.send()
                     await self.download_file_task(reader, file_info, iq['from'], sid); writer.close(); await writer.wait_closed(); return
                 except Exception: continue
             if file_info.get('ibb_allowed'):
@@ -353,7 +468,8 @@ class FileTransferPlugin(BasePlugin):
                 res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
                     'action': 'transport-replace',
                     'sid': sid,
-                    'initiator': iq['from'].full
+                    'initiator': iq['from'].full,
+                    'responder': self.bot.boundjid.full
                 })
                 res_c = ET.SubElement(res_j, '{urn:xmpp:jingle:1}content', {
                     'creator': file_info.get('content_creator', 'initiator'),
@@ -379,6 +495,7 @@ class FileTransferPlugin(BasePlugin):
         else: stream.close()
 
     async def download_file_task(self, reader, file_info, peer_jid, sid):
+        from slixmpp import JID
         user_dir, user_hash = self.bot.get_user_info(peer_jid)
         path = get_unique_path(os.path.join(user_dir, os.path.basename(file_info['name'])))
         received, loop = 0, asyncio.get_event_loop()
@@ -401,9 +518,14 @@ class FileTransferPlugin(BasePlugin):
                     res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
                         'action': 'session-info',
                         'sid': s_sid,
-                        'initiator': peer_jid.full
+                        'initiator': peer_jid.full,
+                        'responder': self.bot.boundjid.full
                     })
-                    ET.SubElement(res_j, f'{{{ft_ns}}}received', {'xmlns': ft_ns})
+                    ET.SubElement(res_j, f'{{{ft_ns}}}received', {
+                        'xmlns': ft_ns,
+                        'creator': file_info.get('content_creator', 'initiator'),
+                        'name': file_info.get('content_name', 'file')
+                    })
                     info_iq.append(res_j); info_iq.send()
 
                     # session-terminate (success)
@@ -411,7 +533,8 @@ class FileTransferPlugin(BasePlugin):
                     res_j = ET.Element('{urn:xmpp:jingle:1}jingle', {
                         'action': 'session-terminate',
                         'sid': s_sid,
-                        'initiator': peer_jid.full
+                        'initiator': peer_jid.full,
+                        'responder': self.bot.boundjid.full
                     })
                     reason = ET.SubElement(res_j, '{urn:xmpp:jingle:1}reason')
                     ET.SubElement(reason, '{urn:xmpp:jingle:1}success')

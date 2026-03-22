@@ -14,6 +14,8 @@ class PresencePlugin(BasePlugin):
         self.bot.add_event_handler("presence_unsubscribed", self.handle_presence_unsubscribed)
 
     async def start(self, event):
+        self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si')
+        self.bot['xep_0030'].add_feature('http://jabber.org/protocol/si/profile/file-transfer')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/bytestreams')
         self.bot['xep_0030'].add_feature('http://jabber.org/protocol/ibb')
         self.bot['xep_0030'].add_feature('urn:xmpp:jingle:1')
