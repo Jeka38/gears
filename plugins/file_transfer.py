@@ -371,6 +371,8 @@ class FileTransferPlugin(BasePlugin):
                 query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
                 if query is None: return
                 sid, peer_full = query.get('sid'), iq['from'].full
+                file_info = self.bot.pending_files.get(sid)
+                if not file_info: return
                 used = query.find('{http://jabber.org/protocol/bytestreams}streamhost-used')
                 if used is not None:
                     jid = used.get('jid'); proxy = self.proxies.get(jid)
@@ -381,7 +383,7 @@ class FileTransferPlugin(BasePlugin):
                 if not hosts and used is None:
                     # SI protocol: empty S5B request -> reply result -> then bot sends its candidates
                     iq.reply().send()
-                    if sid in self.bot.pending_files and not self.bot.pending_files[sid].get('provided_proxies'):
+                    if not file_info.get('provided_proxies'):
                         asyncio.create_task(self._offer_proxies_to_initiator(iq['from'], sid))
                     return
             t_sid = file_info.get('transport_sid', sid)

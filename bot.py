@@ -30,6 +30,7 @@ class OBBFastBot(ClientXMPP):
         self.register_plugin('xep_0030')
         self.register_plugin('xep_0047')
         self['xep_0047'].auto_accept = False
+        self.register_plugin('xep_0166') # Jingle Core
         self.register_plugin('xep_0199')
         self['xep_0199'].send_keepalive = True
         self['xep_0199'].interval = 60
