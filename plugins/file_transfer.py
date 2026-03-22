@@ -29,15 +29,19 @@ class FileTransferPlugin(BasePlugin):
     async def discover_proxies(self):
         logging.info("SOCKS5 Proxy Discovery started")
         try:
-            # Step 1: Discover items on our server
-            items = await self.bot['xep_0030'].get_items(jid=self.bot.boundjid.domain)
-            for item in items['disco_items']:
-                target_jid = item['jid']
+            # Check server domain and its items
+            targets = [self.bot.boundjid.domain]
+            try:
+                items = await self.bot['xep_0030'].get_items(jid=self.bot.boundjid.domain)
+                targets.extend([item['jid'] for item in items['disco_items']])
+            except: pass
+
+            for target_jid in targets:
                 try:
                     # Step 2: Query info for each item
                     info = await self.bot['xep_0030'].get_info(jid=target_jid)
                     # Step 3: Check for SOCKS5 bytestreams feature
-                    if 'http://jabber.org/protocol/bytestreams' in info['features']:
+                    if 'http://jabber.org/protocol/bytestreams' in info['disco_info']['features']:
                         # Step 4: Query the proxy for its host/port
                         iq = self.bot.make_iq_get(ito=target_jid)
                         iq.append(ET.Element('{http://jabber.org/protocol/bytestreams}query'))
