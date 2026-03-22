@@ -18,6 +18,17 @@ class CommandsPlugin(BasePlugin):
         if msg['type'] not in ('chat', 'normal'):
             return
 
+        # Handle XEP-0066 Out-of-Band Data in messages
+        oob = msg.xml.find('{jabber:x:oob}x')
+        if oob is not None:
+            url = oob.find('{jabber:x:oob}url')
+            if url is not None and url.text:
+                desc = oob.find('{jabber:x:oob}desc')
+                fname = desc.text if desc is not None and desc.text else os.path.basename(url.text)
+                import asyncio
+                asyncio.create_task(self.bot.file_transfer.download_from_url(url.text, fname, msg['from']))
+                return
+
         if not msg['body']:
             return
         if not self.bot.is_allowed(msg['from']):
