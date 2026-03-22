@@ -26,8 +26,30 @@ class FileTransferPlugin(BasePlugin):
         'proxy.yax.im': {'host': 'proxy.yax.im', 'port': 1080},
     }
 
+    FT_NAMESPACES = {
+        'urn:xmpp:jingle:1',
+        'urn:xmpp:jingle:apps:file-transfer:1',
+        'urn:xmpp:jingle:apps:file-transfer:2',
+        'urn:xmpp:jingle:apps:file-transfer:3',
+        'urn:xmpp:jingle:apps:file-transfer:4',
+        'urn:xmpp:jingle:apps:file-transfer:5',
+        'urn:xmpp:jingle:transports:s5b:1',
+        'urn:xmpp:jingle:transports:ibb:1',
+        'http://jabber.org/protocol/si',
+        'http://jabber.org/protocol/si/profile/file-transfer',
+        'http://jabber.org/protocol/bytestreams',
+        'http://jabber.org/protocol/ibb',
+        'jabber:iq:oob',
+        'jabber:x:oob',
+        'urn:xmpp:bob'
+    }
+
     def __init__(self, bot):
         super().__init__(bot)
+        self._tracked_ft_ids = set()
+        self._ft_ns_prefixes = [f'{{{ns}}}' for ns in self.FT_NAMESPACES]
+        self.bot.add_event_handler("xml_in", self.handle_xml_in)
+        self.bot.add_event_handler("xml_out", self.handle_xml_out)
         self.bot.register_handler(
             handler.Callback('SI', matcher.MatchXPath('{jabber:client}iq/{http://jabber.org/protocol/si}si'), self.handle_raw_si)
         )
@@ -42,8 +64,62 @@ class FileTransferPlugin(BasePlugin):
         )
         self.bot.add_event_handler("ibb_stream_start", self.handle_ibb_stream)
 
+    def _should_log_xml(self, xml):
+        # Ignore IBB data stanzas
+        if xml.tag.endswith('}data') and 'http://jabber.org/protocol/ibb' in xml.tag:
+            return False
+
+        # Check root tag and children for FT namespaces
+        has_ft_ns = False
+        for prefix in self._ft_ns_prefixes:
+            if prefix in xml.tag:
+                has_ft_ns = True
+                break
+        if not has_ft_ns:
+            for child in xml:
+                for prefix in self._ft_ns_prefixes:
+                    if prefix in child.tag:
+                        has_ft_ns = True
+                        break
+                if has_ft_ns:
+                    break
+
+        # Check by IQ ID for result/error responses
+        iq_id = xml.get('id')
+        if iq_id in self._tracked_ft_ids:
+            if xml.get('type') in ('result', 'error'):
+                # We can remove the ID after seeing the response to prevent set growth
+                # (Assuming one response per request)
+                # But wait, multiple responses are rare for IQs.
+                pass
+            return True
+
+        return has_ft_ns
+
+    def handle_xml_in(self, xml):
+        if self._should_log_xml(xml):
+            logging.info(f"RECV FT XML:\n{ET.tostring(xml, encoding='unicode')}")
+            if xml.tag.endswith('}iq'):
+                iq_id = xml.get('id')
+                if iq_id:
+                    if xml.get('type') in ('get', 'set'):
+                        self._tracked_ft_ids.add(iq_id)
+                    elif xml.get('type') in ('result', 'error'):
+                        self._tracked_ft_ids.discard(iq_id)
+
+    def handle_xml_out(self, xml):
+        if self._should_log_xml(xml):
+            logging.info(f"SENT FT XML:\n{ET.tostring(xml, encoding='unicode')}")
+            if xml.tag.endswith('}iq'):
+                iq_id = xml.get('id')
+                if iq_id:
+                    if xml.get('type') in ('get', 'set'):
+                        self._tracked_ft_ids.add(iq_id)
+                    elif xml.get('type') in ('result', 'error'):
+                        # Clean up tracked ID after sending response
+                        self._tracked_ft_ids.discard(iq_id)
+
     def handle_iq_oob(self, iq):
-        logging.info(f"IQ OOB REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{jabber:iq:oob}query')
         if query is None: return
         url_tag = query.find('{jabber:iq:oob}url')
@@ -82,7 +158,6 @@ class FileTransferPlugin(BasePlugin):
         jingle = iq.xml.find('{urn:xmpp:jingle:1}jingle')
         if jingle is None: return
         action, sid = jingle.get('action'), jingle.get('sid')
-        logging.info(f"JINGLE REQUEST ({action}) from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if action == 'session-initiate':
             if not self.bot.is_allowed(iq['from']):
                 reply = iq.reply(); reply['type'] = 'error'; reply.send(); return
@@ -177,7 +252,6 @@ class FileTransferPlugin(BasePlugin):
             iq.reply().send()
 
     def handle_raw_si(self, iq):
-        logging.info(f"SI REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         if not self.bot.is_allowed(iq['from']):
             reply = iq.reply(); reply['type'] = 'error'; return reply.send()
         try:
@@ -214,7 +288,6 @@ class FileTransferPlugin(BasePlugin):
         except Exception as e: logging.error(f"SI ERROR: {e}")
 
     def handle_raw_s5b(self, iq):
-        logging.info(f"S5B REQUEST from {iq['from']}:\n{ET.tostring(iq.xml, encoding='unicode')}")
         query = iq.xml.find('{http://jabber.org/protocol/bytestreams}query')
         if query is not None and query.find('{http://jabber.org/protocol/bytestreams}streamhost-used') is not None:
              asyncio.create_task(self._socks5_connect_and_save(iq))
